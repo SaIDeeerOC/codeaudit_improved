@@ -1,0 +1,28 @@
+rules:
+  - id: local.python-eval
+    languages: [python]
+    severity: ERROR
+    message: eval() на недоверенных данных приводит к выполнению произвольного кода
+    pattern: eval(...)
+  - id: local.python-shell-true
+    languages: [python]
+    severity: WARNING
+    message: subprocess с shell=True - риск инъекции команд
+    pattern: subprocess.$F(..., shell=True, ...)
+  - id: local.python-sql-concat
+    languages: [python]
+    severity: ERROR
+    message: SQL-запрос собирается из строк - используйте параметризованные запросы
+    pattern-either:
+      - pattern: $C.execute("..." + $X)
+      - pattern: $C.execute(f"...")
+  - id: local.python-tls-verify-off
+    languages: [python]
+    severity: WARNING
+    message: Отключена проверка TLS-сертификата
+    pattern: requests.$F(..., verify=False, ...)
+  - id: local.js-eval
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: eval() выполняет произвольный код
+    pattern: eval(...)

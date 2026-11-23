@@ -1,0 +1,6 @@
+report/
+demo_out/
+report_myrepo/
+__pycache__/
+*.pyc
+.scan_cache.json

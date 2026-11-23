@@ -1,0 +1,18 @@
+[gate]
+max_high = 0          # допустимое число high/critical находок
+min_score = 60        # минимальная итоговая оценка
+
+[style]
+max_line_length = 120
+max_complexity = 10
+max_function_lines = 80
+max_args = 7
+
+[git]
+max_files_per_commit = 50
+max_blob_mb = 5
+min_message_len = 10
+
+[tools]
+offline = true                      # запрет сетевых обращений
+semgrep_config = "semgrep-rules"    # локальные правила (каталог рядом с pipeline.py)
