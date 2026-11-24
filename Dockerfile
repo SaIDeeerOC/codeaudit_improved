@@ -7,5 +7,7 @@ RUN pip install --no-cache-dir ruff bandit semgrep
 # COPY gitleaks /usr/local/bin/gitleaks
 WORKDIR /app
 COPY pipeline.py config.toml ./
+COPY codeaudit ./codeaudit
+COPY semgrep-rules ./semgrep-rules
 ENTRYPOINT ["python3", "/app/pipeline.py"]
 CMD ["/repo", "--out", "/report", "--config", "/app/config.toml"]

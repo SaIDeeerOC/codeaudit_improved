@@ -62,14 +62,20 @@ credentials in URLs (`user:pass@host`), and passwords/tokens hardcoded in code.
 
 - **Live progress.** Every stage prints its status; large repositories get a per-5000-files
   counter (stderr, so stdout stays machine-readable); total elapsed time at the end.
-- **Scan cache.** File hashes are stored in `.scan_cache.json` inside the report folder;
-  a repeated run rescans only changed files. Invalidated when `config.toml` changes;
-  disable with `--no-cache`.
+- **Scan cache.** Hashes for all files, including clean files, are stored in
+  `.scan_cache.json`; unchanged-file results are reused. The cache is invalidated when
+  configuration or analyzer code changes; disable with `--no-cache`.
 - **Run history.** Every run appends a line to `history.jsonl`; reports include a
   "Run history" section with score, high+critical count and gate verdict per run,
   plus the delta against the previous run.
-- **Fault isolation.** A failing stage never stops the pipeline; external tools are used
-  automatically when installed, built-in checks (stdlib + git only) always run offline.
+- **Fault isolation.** A failing stage never stops the pipeline, but an incomplete scan
+  fails the gate (`scan_complete: false`, exit code 1). Invalid configuration exits with
+  code 2.
+- **Consistent file filters.** `scan.exclude_dirs` and `scan.max_file_kb` apply to built-in
+  checks, Ruff, Bandit, Semgrep, and ShellCheck. Gitleaks receives Git-history path
+  exclusions and a whole-megabyte file-size limit (minimum 1 MB).
+- **Module layout.** `codeaudit/` contains configuration, scanners, cache, Git audit,
+  reporting, and shared types; `pipeline.py` remains the CLI entry point.
 
 ## Scoring & quality gate
 
@@ -98,6 +104,10 @@ accuracy and runtime. Full tables: [bench/results.md](bench/results.md).
 - False positives on clean repositories: 0
 - Correct quality-gate decisions: 36/36 (100%)
 - Average analysis time per repository: 0.15 s (max 0.28 s)
+- Run the project tests with `python3 -m unittest discover -s tests -v`.
+
+The checked-in benchmark results are from a previous run. Re-run `bench/bench.py`
+after code changes to refresh the figures and verify the current version.
 
 ### Limitations (for honest interpretation)
 

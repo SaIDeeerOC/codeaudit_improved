@@ -6,7 +6,7 @@ pipeline.py сравниваем множества пар (правило, фа
 Дополнительно: точность решения quality gate и время работы.
 Запуск:  python3 bench/bench.py [--repos 30] [--clean 6]
 """
-import argparse, json, shutil, subprocess, sys, time
+import argparse, atexit, json, shutil, subprocess, sys, tempfile, time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -59,6 +59,14 @@ GIT_TRUTH = {"weak-message": ("weak-message", "", "git", False),
              "large-blob": ("large-blob", "data.bin", "git", False)}
 
 
+def _create_work_dir(parent):
+    parent = Path(parent)
+    parent.mkdir(parents=True, exist_ok=True)
+    work = Path(tempfile.mkdtemp(prefix="codeaudit_bench_", dir=parent))
+    atexit.register(shutil.rmtree, work, ignore_errors=True)
+    return work
+
+
 def g(repo, *a):
     subprocess.run(["git", "-c", "user.name=Dev", "-c", "user.email=dev@example.com", "-C", str(repo), *a],
                    check=True, capture_output=True)
@@ -108,10 +116,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repos", type=int, default=30)
     ap.add_argument("--clean", type=int, default=6)
-    ap.add_argument("--work", default="/tmp/codeaudit_bench")
+    ap.add_argument("--work", default=None,
+                    help="родительская папка для временных репозиториев (сама папка не удаляется)")
     a = ap.parse_args()
-    work = Path(a.work)
-    shutil.rmtree(work, ignore_errors=True)
+    work_parent = Path(a.work).expanduser().resolve() if a.work else Path(tempfile.gettempdir())
+    work = _create_work_dir(work_parent)
     names = list(D)
     allcats, scored = {}, set()
     for n in names:
