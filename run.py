@@ -1,29 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Единая точка входа CodeAudit: меню вместо запоминания команд.
+"""Интерактивная точка входа CodeAudit.
 
-Запуск:  python3 run.py            (Windows: двойной клик по run.bat)
-Быстрый способ: перетащить папку репозитория на run.bat — меню пропустится,
-репозиторий проверится сразу.
-
-Пункты меню:
-  1 - демонстрация: учебный репозиторий с дефектами + прогон конвейера
-  2 - проверка своего репозитория (путь вводится здесь или передаётся аргументом)
-  3 - просмотр и правка порогов строгости (config.toml)
-  4 - справка: где отчёты и что читать дальше
-
-Только стандартная библиотека Python. Работает на Windows, Linux, macOS.
+Запуск: python3 run.py (Windows: run.bat).
+Каталог репозитория можно передать аргументом командной строки.
+Меню предоставляет демонстрационный режим, анализ репозитория, настройку порогов,
+справку и диагностику окружения.
+Используется стандартная библиотека Python; поддерживаются Windows, Linux и macOS.
 """
+import hashlib
 import os
 import re
+import shutil
 import subprocess
 import sys
 import webbrowser
 from pathlib import Path
 
+from codeaudit.config import load_config
+
 HERE = Path(__file__).resolve().parent
 
-# ── Консоль: включаем ANSI-цвета на Windows, отключаем их вне терминала ──
 if os.name == "nt":
     os.system("")  # активирует обработку ANSI-кодов в Windows 10+
 
@@ -72,14 +69,21 @@ def pause():
 
 def ask_path(prompt):
     raw = input(prompt).strip().strip('"').strip("'")
-    return Path(raw).expanduser()
+    return Path(raw).expanduser() if raw else None
 
 
 def find_python_tool():
     return HERE / "pipeline.py", HERE / "config.toml"
 
 
-# ── Пункт 1: демо ──
+def default_report_dir(repo):
+    repo = Path(repo).resolve()
+    identity = os.path.normcase(str(repo))
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:8]
+    safe_name = re.sub(r"[^\w.-]+", "-", repo.name).strip(".-") or "repository"
+    return HERE / "reports" / f"{safe_name}-{digest}"
+
+
 def action_demo():
     print()
     rc = py(HERE / "run_demo.py")
@@ -94,7 +98,6 @@ def action_demo():
     pause()
 
 
-# ── Пункт 2: свой репозиторий ──
 def action_check(repo=None):
     print()
     pipeline, config = find_python_tool()
@@ -103,7 +106,7 @@ def action_check(repo=None):
         print(f"{C_DIM}Подсказка: если репозиторий только на GitHub — сначала")
         print(f"git clone <ссылка>, а не «Download ZIP» (в ZIP нет истории .git).{C_END}\n")
         repo = ask_path("Путь к папке репозитория (или Enter для отмены): ")
-        if not str(repo).strip():
+        if repo is None:
             warn("Отменено.")
             pause()
             return
@@ -119,7 +122,19 @@ def action_check(repo=None):
             pause()
             return
     print()
-    out = HERE / "report_myrepo"
+    default_out = default_report_dir(repo)
+    print(f"Отчёт будет сохранён отдельно для этого репозитория.")
+    raw_out = input(f"Папка отчёта [Enter — {default_out}]: ").strip().strip('"').strip("'")
+    out = Path(raw_out).expanduser() if raw_out else default_out
+    if not out.is_absolute():
+        out = HERE / out
+    out = out.resolve()
+    if (out / "report.html").exists():
+        ans = input(f"В этой папке уже есть отчёт. Обновить его и сохранить историю? [Y/n]: ").strip().lower()
+        if ans not in ("", "y", "yes", "д", "да"):
+            warn("Проверка отменена.")
+            pause()
+            return
     rc = py(pipeline, repo, "--out", out, "--config", config)
     print()
     if rc == 0:
@@ -138,7 +153,7 @@ def action_check(repo=None):
     pause()
 
 
-# ── Пункт 3: пороги config.toml ──
+
 EDITABLE = {
     "gate.min_score": "минимальная оценка для gate (0-100)",
     "gate.max_high": "сколько high/critical находок допустимо",
@@ -210,12 +225,60 @@ def action_config():
     pause()
 
 
-# ── Пункт 4: справка ──
+def action_doctor():
+    print("\nПроверка готовности CodeAudit\n")
+    if sys.version_info >= (3, 11):
+        ok(f"Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
+    else:
+        err(f"Python {sys.version_info.major}.{sys.version_info.minor}: нужен Python 3.11+ для TOML-настроек")
+
+    git_path = shutil.which("git")
+    if git_path:
+        ok(f"Git найден: {git_path}")
+    else:
+        err("Git не найден в PATH. Установите Git и перезапустите терминал.")
+
+    config = HERE / "config.toml"
+    if sys.version_info < (3, 11):
+        warn("config.toml не будет прочитан; будут использованы встроенные настройки.")
+    else:
+        try:
+            cfg = load_config(config)
+            ok(f"Конфигурация прочитана: {config.name}")
+            semgrep_config = Path(cfg["tools"]["semgrep_config"])
+            if not semgrep_config.is_absolute():
+                semgrep_config = HERE / semgrep_config
+            if cfg["tools"]["offline"] and not semgrep_config.exists():
+                warn(f"Не найден каталог локальных правил Semgrep: {semgrep_config}")
+        except (OSError, ValueError) as error:
+            err(f"Ошибка конфигурации: {error}")
+
+    optional_tools = {
+        "ruff": "pip install ruff",
+        "bandit": "pip install bandit",
+        "semgrep": "pip install semgrep",
+        "gitleaks": "установите Gitleaks из пакета вашей ОС",
+        "shellcheck": "установите ShellCheck из пакета вашей ОС",
+    }
+    print("\nНеобязательные анализаторы:")
+    for tool, install_hint in optional_tools.items():
+        path = shutil.which(tool)
+        if path:
+            ok(f"{tool}: найден ({path})")
+        else:
+            warn(f"{tool}: не установлен; будет пропущен. Подсказка: {install_hint}")
+    if os.access(HERE, os.W_OK):
+        ok(f"Папка проекта доступна для записи: {HERE}")
+    else:
+        warn(f"Нет очевидного доступа на запись в папку проекта: {HERE}")
+    pause()
+
+
 def action_help():
     print()
     print("Где искать результаты:")
     print(f"  {C_DIM}демо:{C_END}            demo_out/report.html   (создаёт пункт 1)")
-    print(f"  {C_DIM}свой репозиторий:{C_END} report_myrepo/report.html (создаёт пункт 2)")
+    print(f"  {C_DIM}свой репозиторий:{C_END} reports/<имя-репозитория>-<id>/report.html (создаёт пункт 2)")
     print("\nДальше по документации:")
     print(f"  {C_DIM}ЗАПУСК.md{C_END}  — пошаговая инструкция и «частые проблемы»")
     print(f"  {C_DIM}README.md{C_END}  — архитектура, стадии, метрики качества")
@@ -226,7 +289,6 @@ def action_help():
     pause()
 
 
-# ── Меню ──
 def show_banner():
     ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
     git = f"{C_OK}есть{C_END}" if _git_ok() else f"{C_ERR}не найден{C_END}"
@@ -242,6 +304,7 @@ def show_banner():
     print("  2 — Проверить свой репозиторий")
     print("  3 — Посмотреть и поменять пороги (config.toml)")
     print("  4 — Справка: где отчёты и что читать дальше")
+    print("  5 — Проверить готовность окружения")
     print("  0 — Выход")
 
 
@@ -268,20 +331,22 @@ def menu():
             action_config()
         elif choice == "4":
             action_help()
+        elif choice == "5":
+            action_doctor()
         elif choice in ("0", "q", "Q", "exit"):
             print("Пока!")
             return 0
         else:
-            err("Нет такого пункта. Введи число от 0 до 4.")
+            err("Нет такого пункта. Введи число от 0 до 5.")
 
 
 def main():
     argv = [a for a in sys.argv[1:] if a.strip()]
     if argv:
-        # Аргумент = путь к репозиторию (например, перетащили папку на run.bat)
+        # Аргумент задаёт путь к репозиторию, в том числе при перетаскивании на run.bat.
         action_check(Path(argv[0]))
         return 0
-    # Проверка, что проект лежит рядом (защита от запуска внутри zip)
+    # Отсутствие pipeline.py рядом со скриптом может указывать на запуск из архива.
     if not (HERE / "pipeline.py").exists():
         err("Рядом с run.py нет pipeline.py — скорее всего файл запущен внутри архива.")
         err("Распакуй архив ЦЕЛИКОМ (правый клик — «Извлечь всё») и запускай из распакованной папки.")

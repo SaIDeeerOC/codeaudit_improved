@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 from collections import Counter
 from pathlib import Path
@@ -26,6 +27,7 @@ from codeaudit.reports import score_of, write_reports
 from codeaudit.scanners import (builtin_patterns, builtin_python, builtin_python_lint,
                                 builtin_secrets, builtin_style, tool_bandit, tool_gitleaks,
                                 tool_ruff, tool_semgrep, tool_shellcheck)
+from codeaudit.suppressions import apply_suppressions, load_suppressions
 
 
 def _repo_identity(root):
@@ -39,11 +41,57 @@ def _quality_gate(findings, cfg, scan_complete):
     return score, high, passed
 
 
+def _progress_text(completed, total, name, elapsed, width=20):
+    percent = int(completed * 100 / total) if total else 100
+    filled = int(width * completed / total) if total else width
+    bar = "#" * filled + "-" * (width - filled)
+    return f"[{bar}] {completed}/{total} ({percent:3d}%) | {name} | {elapsed:.0f} с"
+
+
+class _StageProgress:
+    def __init__(self, completed, total, name, started):
+        self.completed = completed
+        self.total = total
+        self.name = name
+        self.started = started
+        self.stop_event = threading.Event()
+        self.thread = None
+        self.failed = False
+
+    def _render(self):
+        elapsed = time.monotonic() - self.started
+        print("\r" + _progress_text(self.completed, self.total, self.name, elapsed),
+              end="", file=sys.stderr, flush=True)
+
+    def __enter__(self):
+        if sys.stderr.isatty():
+            self._render()
+            self.thread = threading.Thread(target=self._tick, daemon=True)
+            self.thread.start()
+        return self
+
+    def _tick(self):
+        while not self.stop_event.wait(1):
+            self._render()
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.stop_event.set()
+        if self.thread:
+            self.thread.join()
+        elapsed = time.monotonic() - self.started
+        text = _progress_text(self.completed + 1, self.total, self.name, elapsed)
+        status = " | ошибка" if exc_type or self.failed else " | готово"
+        prefix = "\r" if self.thread else ""
+        print(prefix + text + status, file=sys.stderr, flush=True)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("repo")
     parser.add_argument("--out", default="report")
     parser.add_argument("--config")
+    parser.add_argument("--suppressions",
+                        help="TOML-файл исключений; по умолчанию используется .codeaudit-suppressions.toml в репозитории")
     parser.add_argument("--no-cache", action="store_true",
                         help="сканировать все файлы заново, не использовать кэш прошлого прогона")
     args = parser.parse_args(argv)
@@ -56,6 +104,15 @@ def main(argv=None):
     except ValueError as error:
         print(f"Ошибка конфигурации: {error}", file=sys.stderr)
         return 2
+    suppressions_path = (Path(args.suppressions).resolve() if args.suppressions
+                         else root / ".codeaudit-suppressions.toml")
+    suppressions, expired_suppressions = [], []
+    if args.suppressions or suppressions_path.exists():
+        try:
+            suppressions, expired_suppressions = load_suppressions(suppressions_path)
+        except ValueError as error:
+            print(f"Ошибка исключений: {error}", file=sys.stderr)
+            return 2
 
     outdir = Path(args.out).resolve()
     if outdir == root:
@@ -80,20 +137,26 @@ def main(argv=None):
         ("builtin-secrets", builtin_secrets), ("git-audit", git_audit),
     ]
     reused_total = 0
-    for name, function in stages:
+    for index, (name, function) in enumerate(stages):
         print(f"[..] {name}: работаю...", flush=True)
-        try:
-            if cache is not None and name in CACHEABLE:
-                result, reused = cached_stage(name, function, root, cfg, cache)
-                reused_total += reused
-                if reused:
-                    notes.append(f"{name}: из кэша переиспользовано файлов: {reused}")
-            else:
-                result, reused = function(root, cfg), 0
-        except Exception as error:
-            failed_stages.append(name)
-            notes.append(f"{name}: ошибка {error!r}")
-            print(f"[!!] {name}: ошибка (подробно в отчёте)", file=sys.stderr, flush=True)
+        stage_started = time.monotonic()
+        stage_failed = False
+        with _StageProgress(index, len(stages), name, stage_started) as stage_progress:
+            try:
+                if cache is not None and name in CACHEABLE:
+                    result, reused = cached_stage(name, function, root, cfg, cache)
+                    reused_total += reused
+                    if reused:
+                        notes.append(f"{name}: из кэша переиспользовано файлов: {reused}")
+                else:
+                    result, reused = function(root, cfg), 0
+            except Exception as error:
+                failed_stages.append(name)
+                notes.append(f"{name}: ошибка {error!r}")
+                print(f"[!!] {name}: ошибка (подробно в отчёте)", file=sys.stderr, flush=True)
+                stage_progress.failed = True
+                stage_failed = True
+        if stage_failed:
             continue
         if result is None:
             notes.append(f"{name}: не установлен или не настроен - пропущен")
@@ -112,6 +175,13 @@ def main(argv=None):
 
     findings = list({(finding.tool, finding.rule, finding.file, finding.line, finding.commit): finding
                      for finding in findings}.values())
+    findings, suppressed_findings = apply_suppressions(findings, suppressions)
+    if expired_suppressions:
+        notes.append(f"Просроченных исключений: {len(expired_suppressions)}; соответствующие находки учитываются.")
+        notes.extend(f"Просрочено исключение: {item.rule} в {item.file}; причина: {item.reason}; срок: {item.expires}"
+                     for item in expired_suppressions)
+    if suppressed_findings:
+        notes.append(f"Исключено по .codeaudit-suppressions.toml: {len(suppressed_findings)} находок.")
     scan_complete = not failed_stages
     if failed_stages:
         notes.append("Неполный скан: ошибки этапов " + ", ".join(failed_stages))
@@ -129,20 +199,24 @@ def main(argv=None):
     previous_same = [entry for entry in previous if entry.get("repo_id") == repo_id]
     entry = {"date": time.strftime("%Y-%m-%dT%H:%M:%S"), "repo": root.name, "repo_id": repo_id,
              "score": score, "gate": gate_ok,
-             "severities": dict(Counter(finding.severity for finding in findings))}
+             "severities": dict(Counter(finding.severity for finding in findings)),
+             "suppressed": len(suppressed_findings)}
     delta = score - previous_same[-1]["score"] if previous_same else None
     with history_path.open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
     elapsed = time.monotonic() - started
     write_reports(outdir, root, findings, score, gate_ok, notes,
                   history=previous_same[-9:] + [dict(entry, current=True)], delta=delta,
-                  elapsed=elapsed, scan_complete=scan_complete)
+                  elapsed=elapsed, scan_complete=scan_complete,
+                  suppressed_findings=suppressed_findings)
     print(f"Оценка {score}/100, high+critical={high}, gate={'OK' if gate_ok else 'FAILED'}; "
           f"отчёты: {args.out}/")
     if not scan_complete:
         print("Сканирование неполное; quality gate считается не пройденным.")
     if delta is not None:
         print(f"Динамика: {previous_same[-1]['score']} -> {score} ({delta:+d} к прошлому прогону)")
+    if suppressed_findings:
+        print(f"Исключено по причине и сроку: {len(suppressed_findings)} находок (см. отчёт).")
     cache_message = f"; из кэша переиспользовано файлов: {reused_total}" if reused_total else ""
     print(f"Готово за {elapsed:.1f} с{cache_message}")
     return 0 if gate_ok else 1

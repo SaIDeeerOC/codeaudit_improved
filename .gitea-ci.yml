@@ -7,6 +7,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: {fetch-depth: 0}      # нужна вся история для аудита Git
+      - run: python3 -m unittest discover -s tests -v
       - run: python3 pipeline.py . --out report --config config.toml
       - uses: actions/upload-artifact@v4
         if: always()

@@ -3,6 +3,6 @@
   "recall": 1.0,
   "f1": 1.0,
   "gate_accuracy": 1.0,
-  "avg_time_s": 0.1522622505823771,
+  "avg_time_s": 0.5670934518178304,
   "fp_on_clean": 0
 }

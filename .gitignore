@@ -1,6 +1,7 @@
 report/
 demo_out/
 report_myrepo/
+reports/
 __pycache__/
 *.pyc
 .scan_cache.json

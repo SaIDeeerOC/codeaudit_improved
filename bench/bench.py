@@ -11,8 +11,10 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 PIPE = HERE.parent / "pipeline.py"
+# Контрольные примеры: параметризованный SQL и запуск команд списком аргументов.
 CLEAN = '''"""Clean module {i}."""
 import json
+import subprocess
 
 
 def load(path):
@@ -25,9 +27,21 @@ class Reader:
 
     def read(self, path):
         return load(path)
+
+
+def query(cursor, name):
+    return cursor.execute("SELECT * FROM users WHERE name = ?", (name,))
+
+
+def run_command(arguments):
+    return subprocess.run(arguments, check=True)
+
+
+def documentation_example():
+    return "Avoid eval and untrusted SQL; use parameters and argument lists."
 '''
 
-# имя -> (файл, содержимое, [(правило, категория)], high?)
+# Имя дефекта -> (файл, содержимое, [(правило, категория)], есть ли high/critical).
 D = {
  "eval": ("d_eval.py", "def run(x):\n    return eval(x)\n", [("dangerous-eval", "vulnerability")], True),
  "shell": ("d_shell.py", 'import subprocess\n\n\ndef run(cmd):\n    subprocess.run("ls " + cmd, shell=True)\n', [("shell-true", "vulnerability")], False),
@@ -128,7 +142,7 @@ def main():
             allcats[r] = c; scored.add(r)
     for n in GIT:
         allcats[GIT_TRUTH[n][0]] = GIT_TRUTH[n][2]; scored.add(GIT_TRUTH[n][0])
-    stat = {r: [0, 0, 0] for r in scored}   # TP FP FN
+    stat = {r: [0, 0, 0] for r in scored}   # Количество TP, FP и FN по каждому правилу.
     gate_ok = gate_n = 0
     times, fp_clean = [], 0
     jobs = [(i, [names[(i * 4 + k) % len(names)] for k in range(5)],
