@@ -1,5 +1,6 @@
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -16,7 +17,7 @@ DEFAULTS = {
             "forbidden_ext": [".exe", ".dll", ".so", ".pem", ".key", ".p12", ".pfx", ".env", ".sqlite", ".zip"],
             "weak_messages": ["wip", "fix", "fixes", "update", "test", "asd", "qwe", "temp", "."]},
     "style": {"max_line_length": 120, "max_complexity": 10, "max_function_lines": 80, "max_args": 7},
-    "tools": {"semgrep_config": "semgrep-rules", "offline": True},
+    "tools": {"semgrep_config": "semgrep-rules", "offline": True, "required": [], "versions": {}},
 }
 
 
@@ -56,6 +57,20 @@ def _validate_config(cfg):
         raise ValueError("[tools].semgrep_config должен быть непустой строкой")
     if not isinstance(cfg["tools"]["offline"], bool):
         raise ValueError("[tools].offline должен быть логическим значением")
+    tool_names = {"ruff", "bandit", "semgrep", "gitleaks", "shellcheck"}
+    required = cfg["tools"]["required"]
+    if not isinstance(required, list) or not all(
+            isinstance(item, str) and item in tool_names for item in required):
+        raise ValueError("[tools].required должен быть списком известных анализаторов")
+    versions = cfg["tools"]["versions"]
+    if not isinstance(versions, dict):
+        raise ValueError("[tools].versions должен быть таблицей версий")
+    for name, constraint in versions.items():
+        if name not in tool_names or not isinstance(constraint, str) or not constraint:
+            raise ValueError("[tools].versions должен содержать диапазоны версий известных анализаторов")
+        for part in constraint.split(","):
+            if not re.fullmatch(r"\s*(?:==|!=|>=|<=|>|<|~=)\s*\d+(?:\.\d+)*\s*", part):
+                raise ValueError(f"неверное ограничение версии для {name}: {constraint}")
 
 
 def load_config(path):

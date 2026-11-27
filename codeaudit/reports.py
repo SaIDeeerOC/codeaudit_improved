@@ -1,4 +1,3 @@
-import hashlib
 import html
 import json
 from collections import Counter
@@ -9,6 +8,7 @@ from pathlib import PureWindowsPath
 from urllib.parse import quote
 
 from .core import Finding, SEV, WEIGHT, atomic_write_text
+from .fingerprints import fingerprinted_findings
 from .suppressions import SuppressedFinding
 
 REMEDIATION = {
@@ -36,6 +36,7 @@ def _markdown_cell(value):
 class _ReportData:
     root: Path
     findings: list[Finding]
+    baseline_findings: list[Finding]
     suppressed_findings: list[SuppressedFinding]
     score: int
     gate_ok: bool
@@ -45,6 +46,9 @@ class _ReportData:
     elapsed: float | None
     scan_complete: bool
     coverage: dict
+    finding_changes: dict
+    provenance: dict
+    fingerprints: dict
     severities: Counter
     categories: Counter
 
@@ -75,7 +79,7 @@ def _sarif_uri(filename):
     return quote(path.as_posix(), safe="/-._~"), True
 
 
-def _sarif_result(finding, rule_index, suppressed=None):
+def _sarif_result(finding, rule_index, fingerprint, suppressed=None, baseline=False):
     result = {
         "ruleId": _sarif_rule_id(finding),
         "ruleIndex": rule_index,
@@ -84,6 +88,9 @@ def _sarif_result(finding, rule_index, suppressed=None):
         "properties": {"category": finding.category, "tool": finding.tool,
                        "severity": finding.severity},
     }
+    if baseline:
+        result["baselineState"] = "unchanged"
+        result["properties"]["baseline"] = True
     if finding.file:
         uri, relative = _sarif_uri(finding.file)
         artifact = {"uri": uri}
@@ -101,19 +108,21 @@ def _sarif_result(finding, rule_index, suppressed=None):
             "status": "accepted",
             "justification": f"{suppressed.reason} (expires {suppressed.expires})",
         }]
-    digest_input = "\0".join((result["ruleId"], finding.file, str(finding.line), finding.commit))
-    result["partialFingerprints"] = {
-        "codeaudit/v1": hashlib.sha256(digest_input.encode("utf-8")).hexdigest()
-    }
+    result["partialFingerprints"] = {"codeaudit/v2": fingerprint}
     return result
 
 
 def _sarif_document(report):
-    findings = [(finding, None) for finding in report.findings]
-    findings.extend((item.finding, item) for item in report.suppressed_findings)
+    findings = [(finding, None, False) for finding in report.findings]
+    findings.extend((finding, None, True) for finding in report.baseline_findings)
+    findings.extend((item.finding, item, False) for item in report.suppressed_findings)
+    visible = [finding for finding, _, _ in findings]
+    fallback = {id(finding): fingerprint for fingerprint, finding in fingerprinted_findings(visible)}
+    fingerprints = [report.fingerprints.get(id(finding), fallback[id(finding)])
+                    for finding in visible]
     rule_levels = {}
     rule_properties = {}
-    for finding, _ in findings:
+    for finding, _, _ in findings:
         rule_id = _sarif_rule_id(finding)
         level = _sarif_level(finding.severity)
         rank = {"note": 0, "warning": 1, "error": 2}
@@ -130,8 +139,11 @@ def _sarif_document(report):
         "defaultConfiguration": {"level": rule_levels[rule_id]},
         "properties": rule_properties[rule_id],
     } for rule_id in rule_ids]
-    results = [_sarif_result(finding, rule_indices[_sarif_rule_id(finding)], suppressed)
-               for finding, suppressed in findings]
+    results = [
+        _sarif_result(finding, rule_indices[_sarif_rule_id(finding)], fingerprint,
+                      suppressed, baseline)
+        for (finding, suppressed, baseline), fingerprint in zip(findings, fingerprints)
+    ]
     source_uri = report.root.resolve().as_uri()
     if not source_uri.endswith("/"):
         source_uri += "/"
@@ -148,18 +160,29 @@ def _sarif_document(report):
                 "gatePassed": report.gate_ok,
                 "scanComplete": report.scan_complete,
                 "coverage": report.coverage,
+                "provenance": report.provenance,
+                "findingChanges": report.finding_changes,
             },
         }],
     }
 
 
 def _write_json_report(outdir, report, summary):
-    data = {"summary": summary, "findings": [finding.__dict__ for finding in report.findings],
+    visible = [*report.findings, *report.baseline_findings]
+    fallback = {id(finding): fingerprint for fingerprint, finding in fingerprinted_findings(visible)}
+    fingerprint_of = lambda finding: report.fingerprints.get(id(finding), fallback[id(finding)])
+    data = {"summary": summary,
+            "findings": [{**finding.__dict__, "fingerprint": fingerprint_of(finding)}
+                         for finding in report.findings],
+            "baseline_findings": [{**finding.__dict__, "fingerprint": fingerprint_of(finding)}
+                                  for finding in report.baseline_findings],
             "suppressed_findings": [
                 {**item.finding.__dict__, "suppression_reason": item.reason,
                  "suppression_expires": item.expires}
                 for item in report.suppressed_findings],
-            "coverage": report.coverage}
+            "coverage": report.coverage,
+            "finding_changes": report.finding_changes,
+            "provenance": report.provenance}
     atomic_write_text(outdir / "report.json", json.dumps(data, ensure_ascii=False, indent=2))
 
 
@@ -189,6 +212,39 @@ def _append_markdown_findings(markdown, findings):
         markdown.append("| " + " | ".join(_markdown_cell(value) for value in values) + " |")
 
 
+def _append_markdown_changes(markdown, changes):
+    markdown.extend(["", "## Изменения находок между запусками", ""])
+    if not changes.get("available"):
+        markdown.append("Сравнение не выполнялось: нет предыдущего полного сканирования "
+                        "или текущий прогон неполный.")
+        return
+    for key, title in (("new", "Новые"), ("reopened", "Повторно появившиеся"),
+                       ("resolved", "Устранённые")):
+        items = changes.get(key, [])
+        markdown.extend([f"### {title}: {len(items)}", ""])
+        if items:
+            markdown.extend(
+                f"- `{_markdown_cell(item.get('rule', '?'))}` — "
+                f"`{_markdown_cell(item.get('file', ''))}`:{item.get('line', 0)} "
+                f"({item.get('severity', 'info')})"
+                for item in items)
+        else:
+            markdown.append("Нет.")
+
+
+def _append_markdown_provenance(markdown, provenance):
+    markdown.extend(["", "## Воспроизводимость", ""])
+    for label, key in (
+            ("Commit", "repository_commit"), ("Ref", "repository_ref"),
+            ("CodeAudit", "codeaudit_version"), ("Python", "python_version"),
+            ("Конфигурация SHA-256", "config_fingerprint"),
+            ("Локальные правила SHA-256", "local_rules_fingerprint")):
+        markdown.append(f"- **{label}:** `{_markdown_cell(provenance.get(key) or 'не определено')}`")
+    markdown.append("- **Версии анализаторов:** " + _markdown_cell(
+        ", ".join(f"{name} {version}" for name, version
+                  in provenance.get("tool_versions", {}).items()) or "не обнаружены"))
+
+
 def _append_markdown_suppressions(markdown, suppressed_findings):
     if not suppressed_findings:
         return
@@ -210,6 +266,7 @@ def _write_markdown_report(outdir, report):
                 + (f"  |  Время анализа: {report.elapsed:.1f} с"
                    if report.elapsed is not None else ""), "",
                 f"**Сканирование:** {'полное' if report.scan_complete else 'неполное'}", "",
+                f"**Совпавших baseline-находок:** {len(report.baseline_findings)}", "",
                 "| Критичность | Кол-во |", "|---|---|"]
     markdown += [f"| {severity} | {report.severities.get(severity, 0)} |" for severity in reversed(SEV)]
     markdown += ["", "Категории: " +
@@ -229,22 +286,35 @@ def _write_markdown_report(outdir, report):
             for issue in report.coverage["issues"])
     markdown.append("")
     markdown += [f"_{_markdown_cell(note)}_" for note in report.notes]
+    _append_markdown_provenance(markdown, report.provenance)
     _append_markdown_history(markdown, report.history, report.delta)
+    _append_markdown_changes(markdown, report.finding_changes)
     _append_markdown_findings(markdown, report.findings)
+    if report.baseline_findings:
+        markdown.extend(["", "## Совпавшие находки baseline", "",
+                         "Показаны отдельно; не учитываются в score и quality gate.", "",
+                         "| Sev | Категория | Инструмент | Правило | Место | Описание |",
+                         "|---|---|---|---|---|---|"])
+        for finding in report.baseline_findings:
+            values = (finding.severity, finding.category, finding.tool, finding.rule,
+                      _finding_location(finding), finding.message)
+            markdown.append("| " + " | ".join(_markdown_cell(value) for value in values) + " |")
     _append_markdown_suppressions(markdown, report.suppressed_findings)
     atomic_write_text(outdir / "report.md", "\n".join(markdown))
 
 
-def _html_finding_row(finding, suppressed, reason, expires, color):
+def _html_finding_row(finding, suppressed, reason, expires, color, baseline=False):
     location = _finding_location(finding)
     status = (f"Исключено до {html.escape(expires)}: {html.escape(reason)}"
-              if suppressed else "Активная находка")
+              if suppressed else "Baseline (не влияет на score/gate)" if baseline
+              else "Активная находка")
     fallback = "Проверьте контекст и исправьте находку либо зафиксируйте обоснованное исключение."
     remediation = ("Учтите исключение в установленный срок."
                    if suppressed else REMEDIATION.get(finding.rule, fallback))
     searchable = " ".join((finding.severity, finding.category, finding.tool, finding.rule,
                            location, finding.message, remediation, reason))
-    return (f"<tr data-status=\"{'suppressed' if suppressed else 'active'}\" "
+    row_status = "suppressed" if suppressed else "baseline" if baseline else "active"
+    return (f"<tr data-status=\"{row_status}\" "
             f"data-severity=\"{html.escape(finding.severity)}\" "
             f"data-category=\"{html.escape(finding.category)}\" "
             f"data-search=\"{html.escape(searchable)}\">"
@@ -278,14 +348,16 @@ def _history_html(report):
 def _html_filters(report):
     categories = set(report.categories) | {item.finding.category
                                            for item in report.suppressed_findings}
+    categories.update(finding.category for finding in report.baseline_findings)
     category_options = "".join(
         f"<option value=\"{html.escape(category)}\">{html.escape(category)}</option>"
         for category in sorted(categories))
     status_filter = ""
-    if report.suppressed_findings:
+    if report.suppressed_findings or report.baseline_findings:
         status_filter = (
             "<label>Статус <select id=\"status\"><option value=\"\">Все</option>"
             "<option value=\"active\">Активные</option>"
+            "<option value=\"baseline\">Baseline</option>"
             "<option value=\"suppressed\">Исключённые</option></select></label>")
     severity_options = "".join(
         f"<option value=\"{html.escape(severity)}\">{html.escape(severity)}</option>"
@@ -304,10 +376,11 @@ def _html_filters(report):
 def _html_table(report):
     color = {"critical": "#b00020", "high": "#d84315", "medium": "#f9a825",
              "low": "#558b2f", "info": "#607d8b"}
-    display_rows = [(finding, False, "", "") for finding in report.findings]
-    display_rows.extend((item.finding, True, item.reason, item.expires)
+    display_rows = [(finding, False, "", "", color, False) for finding in report.findings]
+    display_rows.extend((finding, False, "", "", color, True) for finding in report.baseline_findings)
+    display_rows.extend((item.finding, True, item.reason, item.expires, color, False)
                         for item in report.suppressed_findings)
-    rows = "".join(_html_finding_row(*row, color) for row in display_rows)
+    rows = "".join(_html_finding_row(*row) for row in display_rows)
     titles = ("Sev", "Категория", "Инструмент", "Правило", "Место",
               "Описание", "Что проверить", "Статус / причина")
     headers = "".join(
@@ -344,6 +417,8 @@ def _write_html_report(report):
                   "</ul>") if report.notes else ""
     history_html = _history_html(report)
     coverage_html = _coverage_html(report.coverage)
+    changes_html = _changes_html(report.finding_changes)
+    provenance_html = _provenance_html(report.provenance)
     severity_summary = ", ".join(
         f"{key}: {value}" for key, value in report.severities.items())
     return "".join((
@@ -360,9 +435,44 @@ def _write_html_report(report):
         f"{'OK' if report.gate_ok else 'FAILED'}</h1>"
         f"<p>{severity_summary}</p>"
         f"<p>Сканирование {'полное' if report.scan_complete else 'неполное'}; "
+        f"baseline: {len(report.baseline_findings)}; "
         f"исключено с причиной и сроком: {len(report.suppressed_findings)}</p>"
-        f"{notes_html}{history_html}{coverage_html}"
+        f"{notes_html}{provenance_html}{history_html}{changes_html}{coverage_html}"
         f"{_html_filters(report)}{_html_table(report)}{_HTML_SCRIPT}"))
+
+
+def _changes_html(changes):
+    if not changes.get("available"):
+        return "<h2>Изменения находок между запусками</h2><p>Сравнение недоступно: " \
+               "нужны два полных сканирования.</p>"
+    rows = []
+    for key, label in (("new", "Новые"), ("reopened", "Повторно появившиеся"),
+                       ("resolved", "Устранённые")):
+        for item in changes.get(key, []):
+            rows.append(
+                f"<tr><td>{label}</td><td>{html.escape(str(item.get('rule', '?')))}</td>"
+                f"<td>{html.escape(str(item.get('file', '')))}:{int(item.get('line', 0))}</td>"
+                f"<td>{html.escape(str(item.get('severity', 'info')))}</td></tr>")
+    table = ("<table><tr><th>Статус<th>Правило<th>Файл<th>Критичность</tr>"
+             + "".join(rows) + "</table>") if rows else "<p>Изменений нет.</p>"
+    return "<h2>Изменения находок между запусками</h2>" + table
+
+
+def _provenance_html(provenance):
+    rows = [
+        ("Commit", provenance.get("repository_commit")),
+        ("Ref", provenance.get("repository_ref")),
+        ("CodeAudit", provenance.get("codeaudit_version")),
+        ("Python", provenance.get("python_version")),
+        ("Конфигурация SHA-256", provenance.get("config_fingerprint")),
+        ("Локальные правила SHA-256", provenance.get("local_rules_fingerprint")),
+        ("Версии анализаторов", ", ".join(
+            f"{name} {version}" for name, version in provenance.get("tool_versions", {}).items())
+         or "не обнаружены"),
+    ]
+    return ("<h2>Воспроизводимость</h2><table><tr><th>Параметр<th>Значение</tr>"
+            + "".join(f"<tr><td>{html.escape(str(key))}</td><td>{html.escape(str(value or 'не определено'))}</td></tr>"
+                      for key, value in rows) + "</table>")
 
 
 def _coverage_html(coverage):
@@ -379,9 +489,14 @@ def _coverage_html(coverage):
 
 
 def write_reports(outdir, root, findings, score, gate_ok, notes, history=None, delta=None,
-                  elapsed=None, scan_complete=True, suppressed_findings=None, coverage=None):
+                  elapsed=None, scan_complete=True, suppressed_findings=None, coverage=None,
+                  baseline_findings=None, finding_changes=None, provenance=None, fingerprints=None):
     outdir.mkdir(parents=True, exist_ok=True)
     suppressed_findings = suppressed_findings or []
+    baseline_findings = baseline_findings or []
+    finding_changes = finding_changes or {"available": False, "new": [], "reopened": [], "resolved": []}
+    provenance = provenance or {}
+    fingerprints = fingerprints or {}
     findings = sorted(findings, key=lambda finding: (-SEV.index(finding.severity),
                                                       finding.category, finding.file))
     suppressed_findings = sorted(
@@ -392,11 +507,14 @@ def write_reports(outdir, root, findings, score, gate_ok, notes, history=None, d
     summary = {"repo": str(root), "date": datetime.now().isoformat(timespec="seconds"),
                "score": score, "gate_passed": gate_ok, "scan_complete": scan_complete,
                "by_severity": dict(severities), "by_category": dict(categories),
-               "suppressed_count": len(suppressed_findings), "notes": notes}
+               "suppressed_count": len(suppressed_findings),
+               "baseline_count": len(baseline_findings), "notes": notes,
+               "finding_changes": finding_changes, "provenance": provenance}
     coverage = coverage or {"files_considered": 0, "size_limited_files": 0, "errors": 0, "issues": []}
     summary["coverage"] = coverage
-    report = _ReportData(root, findings, suppressed_findings, score, gate_ok, notes,
-                         history, delta, elapsed, scan_complete, coverage, severities, categories)
+    report = _ReportData(root, findings, baseline_findings, suppressed_findings, score, gate_ok, notes,
+                         history, delta, elapsed, scan_complete, coverage,
+                         finding_changes, provenance, fingerprints, severities, categories)
     _write_json_report(outdir, report, summary)
     _write_markdown_report(outdir, report)
     atomic_write_text(outdir / "report.html", _write_html_report(report))

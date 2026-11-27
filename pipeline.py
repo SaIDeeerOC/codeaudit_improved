@@ -21,9 +21,12 @@ for stream in (sys.stdout, sys.stderr):
         pass
 
 from codeaudit.cache import CACHEABLE, cache_load, cache_save, cached_stage
+from codeaudit.baseline import baseline_diff, build_baseline, load_baseline, write_baseline
 from codeaudit.config import load_config
 from codeaudit.core import ScanCoverage, atomic_write_text
+from codeaudit.fingerprints import fingerprinted_findings
 from codeaudit.history import git_audit
+from codeaudit.provenance import build_provenance, collect_tool_versions, version_satisfies
 from codeaudit.reports import score_of, write_reports
 from codeaudit.scanners import (builtin_patterns, builtin_python, builtin_python_lint,
                                 builtin_secrets, builtin_style, tool_bandit, tool_gitleaks,
@@ -40,6 +43,44 @@ def _quality_gate(findings, cfg, scan_complete):
     high = sum(finding.severity in ("high", "critical") for finding in findings)
     passed = scan_complete and high <= cfg["gate"]["max_high"] and score >= cfg["gate"]["min_score"]
     return score, high, passed
+
+
+def _finding_records(findings, fingerprints=None):
+    fingerprints = fingerprints or {
+        id(finding): fingerprint for fingerprint, finding in fingerprinted_findings(findings)
+    }
+    return [{
+        "fingerprint": fingerprints[id(finding)],
+        "category": finding.category,
+        "tool": finding.tool,
+        "severity": finding.severity,
+        "rule": finding.rule,
+        "message": finding.message,
+        "file": finding.file.replace("\\", "/"),
+        "line": finding.line,
+        "commit": finding.commit,
+    } for finding in findings]
+
+
+def _finding_lifecycle(current, previous_entries, scan_complete, fingerprints=None):
+    empty = {"available": False, "new": [], "reopened": [], "resolved": []}
+    if not scan_complete:
+        return empty
+    records = _finding_records(current, fingerprints)
+    current_by_id = {item["fingerprint"]: item for item in records}
+    complete_history = [entry for entry in previous_entries if entry.get("scan_complete")]
+    previous = complete_history[-1] if complete_history else None
+    seen = {fingerprint for entry in complete_history
+            for fingerprint in entry.get("finding_fingerprints", [])}
+    previous_records = {
+        item["fingerprint"]: item for item in previous.get("finding_records", [])
+        if isinstance(item, dict) and isinstance(item.get("fingerprint"), str)
+    } if previous else {}
+    new = [item for key, item in current_by_id.items() if key not in seen]
+    reopened = [item for key, item in current_by_id.items()
+                if key in seen and key not in previous_records]
+    resolved = [item for key, item in previous_records.items() if key not in current_by_id]
+    return {"available": True, "new": new, "reopened": reopened, "resolved": resolved}
 
 
 def _progress_text(completed, total, name, elapsed, width=20):
@@ -88,14 +129,34 @@ class _StageProgress:
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("repo")
+    parser.add_argument("repo", nargs="?")
     parser.add_argument("--out", default="report")
     parser.add_argument("--config")
+    parser.add_argument("--baseline", help="путь к локальному baseline находок")
+    parser.add_argument("--update-baseline", action="store_true",
+                        help="показать diff и явно обновить baseline после полного сканирования")
+    parser.add_argument("--show-baseline", help="показать содержимое baseline и завершить работу")
     parser.add_argument("--suppressions",
                         help="TOML-файл исключений; по умолчанию используется .codeaudit-suppressions.toml в репозитории")
     parser.add_argument("--no-cache", action="store_true",
                         help="сканировать все файлы заново, не использовать кэш прошлого прогона")
     args = parser.parse_args(argv)
+    if args.show_baseline:
+        try:
+            baseline = load_baseline(args.show_baseline)
+        except ValueError as error:
+            print(f"Ошибка baseline: {error}", file=sys.stderr)
+            return 2
+        print(f"Baseline для {baseline['repo_id']} ({len(baseline['findings'])} находок):")
+        for item in baseline["findings"]:
+            print(f"- {item['severity']} {item['tool']}/{item['rule']} "
+                  f"{item['file']}:{item['line']} — {item['message']}")
+        return 0
+    if args.repo is None:
+        parser.error("укажите репозиторий (или используйте --show-baseline)")
+    if args.update_baseline and not args.baseline:
+        print("Ошибка: --update-baseline требует --baseline PATH", file=sys.stderr)
+        return 2
     root = Path(args.repo).resolve()
     if not root.is_dir():
         print("Каталог не найден", file=sys.stderr)
@@ -105,6 +166,21 @@ def main(argv=None):
     except ValueError as error:
         print(f"Ошибка конфигурации: {error}", file=sys.stderr)
         return 2
+    repo_id = _repo_identity(root)
+    baseline = None
+    if args.baseline:
+        baseline_path = Path(args.baseline).resolve()
+        if baseline_path.exists():
+            try:
+                baseline = load_baseline(baseline_path, repo_id)
+            except ValueError as error:
+                print(f"Ошибка baseline: {error}", file=sys.stderr)
+                return 2
+        elif not args.update_baseline:
+            print(f"Ошибка baseline: файл не найден: {baseline_path}", file=sys.stderr)
+            return 2
+    else:
+        baseline_path = None
     suppressions_path = (Path(args.suppressions).resolve() if args.suppressions
                          else root / ".codeaudit-suppressions.toml")
     suppressions, expired_suppressions = [], []
@@ -131,6 +207,22 @@ def main(argv=None):
     cache = None if args.no_cache else cache_load(outdir, args.config)
     findings, notes, failed_stages = [], [], []
     coverage = ScanCoverage()
+    tool_versions, version_errors = collect_tool_versions()
+    for name, error in version_errors.items():
+        notes.append(f"{name}: {error}")
+    required_tools = set(cfg["tools"]["required"])
+    requirement_failures = set()
+    for name in sorted(required_tools):
+        if name not in tool_versions:
+            requirement_failures.add(name)
+    for name, constraint in cfg["tools"]["versions"].items():
+        if not version_satisfies(tool_versions.get(name), constraint):
+            requirement_failures.add(name)
+            notes.append(f"{name}: версия {tool_versions.get(name, 'не обнаружена')} "
+                         f"не соответствует ограничению {constraint}")
+    if requirement_failures:
+        notes.append("Не выполнены требования к анализаторам: " +
+                     ", ".join(sorted(requirement_failures)))
     stages = [
         ("ruff", tool_ruff, True), ("bandit", tool_bandit, True),
         ("semgrep", tool_semgrep, True), ("gitleaks", tool_gitleaks, False),
@@ -164,6 +256,8 @@ def main(argv=None):
             continue
         if result is None:
             notes.append(f"{name}: не установлен или не настроен - пропущен")
+            if name in required_tools:
+                requirement_failures.add(name)
             print(f"[--] {name}: пропущен (не установлен/не настроен)", flush=True)
             continue
         print(f"[ok] {name}: {len(result)}" +
@@ -191,9 +285,28 @@ def main(argv=None):
         notes.append(f"Файлов сверх лимита размера: {coverage_data['size_limited_files']}; см. сведения об охвате.")
     if coverage_data["errors"]:
         notes.append(f"Ошибок доступа к файлам или каталогам: {coverage_data['errors']}; скан неполный.")
-    scan_complete = not failed_stages and not coverage.has_errors
+    scan_complete = not failed_stages and not coverage.has_errors and not requirement_failures
     if failed_stages:
         notes.append("Неполный скан: ошибки этапов " + ", ".join(failed_stages))
+    if requirement_failures:
+        notes.append("Неполный скан: не выполнены требования к анализаторам " +
+                     ", ".join(sorted(requirement_failures)))
+
+    all_findings = findings
+    fingerprint_map = {
+        id(finding): fingerprint for fingerprint, finding in fingerprinted_findings(all_findings)
+    }
+    baseline_findings = []
+    if baseline:
+        baseline_ids = {item["fingerprint"] for item in baseline["findings"]}
+        baseline_pairs = [(fingerprint_map[id(finding)], finding) for finding in all_findings]
+        baseline_findings = [finding for fingerprint, finding in baseline_pairs
+                             if fingerprint in baseline_ids]
+        findings = [finding for fingerprint, finding in baseline_pairs
+                    if fingerprint not in baseline_ids]
+        if baseline_findings:
+            notes.append(f"Совпавших baseline-находок: {len(baseline_findings)}; они не влияют на score/gate.")
+
     score, high, gate_ok = _quality_gate(findings, cfg, scan_complete)
 
     history_path = outdir / "history.jsonl"
@@ -204,20 +317,51 @@ def main(argv=None):
             previous.append(json.loads(line))
         except json.JSONDecodeError:
             continue
-    repo_id = _repo_identity(root)
     previous_same = [entry for entry in previous if entry.get("repo_id") == repo_id]
+    finding_changes = _finding_lifecycle(all_findings, previous_same, scan_complete, fingerprint_map)
+    records = _finding_records(all_findings, fingerprint_map)
     entry = {"date": time.strftime("%Y-%m-%dT%H:%M:%S"), "repo": root.name, "repo_id": repo_id,
              "score": score, "gate": gate_ok,
              "severities": dict(Counter(finding.severity for finding in findings)),
-             "suppressed": len(suppressed_findings)}
+             "suppressed": len(suppressed_findings), "scan_complete": scan_complete,
+             "finding_fingerprints": [item["fingerprint"] for item in records],
+             "finding_records": records, "finding_changes": finding_changes}
     delta = score - previous_same[-1]["score"] if previous_same else None
+    provenance = build_provenance(root, args.config, cfg, tool_versions)
+    notes.extend(provenance.get("metadata_errors", []))
+    if args.update_baseline:
+        if not scan_complete:
+            notes.append("Baseline не обновлён: требуется полное сканирование.")
+            print("Baseline не обновлён: сканирование неполное.", file=sys.stderr)
+        else:
+            updated_baseline = build_baseline(repo_id, all_findings)
+            added, removed = baseline_diff(baseline, updated_baseline)
+            print(f"Diff baseline: +{len(added)} новых, -{len(removed)} удалённых.")
+            for item in added:
+                print(f"+ {item['severity']} {item['tool']}/{item['rule']} "
+                      f"{item['file']}:{item['line']} — {item['message']!r}")
+            for item in removed:
+                print(f"- {item['severity']} {item['tool']}/{item['rule']} "
+                      f"{item['file']}:{item['line']} — {item['message']!r}")
+            try:
+                approval = input("Сохранить этот baseline? [y/N]: ").strip().lower()
+            except EOFError:
+                approval = ""
+            if approval in ("y", "yes", "д", "да"):
+                write_baseline(baseline_path, updated_baseline)
+                print(f"Baseline сохранён: {baseline_path}")
+            else:
+                notes.append("Baseline не обновлён: подтверждение не дано.")
+                print("Baseline не обновлён.")
     separator = "\n" if history_text and not history_text.endswith("\n") else ""
     atomic_write_text(history_path, history_text + separator + json.dumps(entry, ensure_ascii=False) + "\n")
     elapsed = time.monotonic() - started
     write_reports(outdir, root, findings, score, gate_ok, notes,
                   history=previous_same[-9:] + [dict(entry, current=True)], delta=delta,
                   elapsed=elapsed, scan_complete=scan_complete,
-                  suppressed_findings=suppressed_findings, coverage=coverage_data)
+                  suppressed_findings=suppressed_findings, coverage=coverage_data,
+                  baseline_findings=baseline_findings, finding_changes=finding_changes,
+                  provenance=provenance, fingerprints=fingerprint_map)
     print(f"Оценка {score}/100, high+critical={high}, gate={'OK' if gate_ok else 'FAILED'}; "
           f"отчёты: {args.out}/")
     if not scan_complete:

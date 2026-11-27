@@ -9,14 +9,18 @@ from pathlib import Path
 from unittest.mock import patch
 
 from bench.bench import _create_work_dir
+from codeaudit.baseline import baseline_diff, build_baseline, load_baseline, write_baseline
 from codeaudit.cache import cached_stage
 from codeaudit.config import load_config
 from codeaudit.core import CoverageIssue, Finding, ScanCoverage, atomic_write_text, iter_files
+from codeaudit.fingerprints import fingerprinted_findings
+from codeaudit.provenance import version_satisfies
 from codeaudit.reports import write_reports
 from codeaudit.scanners import (_checked_output, builtin_patterns, builtin_python,
                                 builtin_secrets, tool_ruff)
 from codeaudit.suppressions import SuppressedFinding, apply_suppressions, load_suppressions
-from pipeline import _progress_text, _quality_gate, _repo_identity, main as run_pipeline
+from pipeline import (_finding_lifecycle, _finding_records, _progress_text, _quality_gate,
+                      _repo_identity, main as run_pipeline)
 from run import default_report_dir
 
 
@@ -30,6 +34,209 @@ class ConfigTests(unittest.TestCase):
             config.write_text("[gate]\nmin_socre = 50\n", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "неизвестные параметры"):
                 load_config(config)
+
+    def test_validates_required_tools_and_version_constraints(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "config.toml"
+            config.write_text('[tools]\nrequired = ["bandit"]\n[tools.versions]\nbandit = ">=1.2,<2.0"\n',
+                              encoding="utf-8")
+            self.assertEqual(load_config(config)["tools"]["required"], ["bandit"])
+            config.write_text('[tools]\nrequired = ["missing-tool"]\n', encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "tools].required"):
+                load_config(config)
+
+
+class FindingIdentityTests(unittest.TestCase):
+    def test_fingerprint_ignores_line_changes_and_normalizes_path_separators(self):
+        first = Finding("vulnerability", "builtin", "high", "dangerous-eval",
+                        "dynamic execution", "src\\app.py", 10)
+        moved_line = Finding("vulnerability", "builtin", "high", "dangerous-eval",
+                             "dynamic execution", "src/app.py", 22)
+        moved_path = Finding("vulnerability", "builtin", "high", "dangerous-eval",
+                             "dynamic execution", "src/renamed.py", 22)
+        first_id = fingerprinted_findings([first])[0][0]
+        self.assertEqual(first_id, fingerprinted_findings([moved_line])[0][0])
+        self.assertNotEqual(first_id, fingerprinted_findings([moved_path])[0][0])
+
+    def test_baseline_diff_and_repository_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "baseline.json"
+            first = Finding("vulnerability", "builtin", "high", "dangerous-eval",
+                            "dynamic execution", "app.py", 1)
+            second = Finding("style", "builtin", "low", "bare-except", "bare except", "app.py", 3)
+            previous = build_baseline("repo-a", [first])
+            updated = build_baseline("repo-a", [second])
+            write_baseline(path, previous)
+            loaded = load_baseline(path, "repo-a")
+            added, removed = baseline_diff(loaded, updated)
+            self.assertEqual([item["rule"] for item in added], ["bare-except"])
+            self.assertEqual([item["rule"] for item in removed], ["dangerous-eval"])
+            with self.assertRaisesRegex(ValueError, "другого расположения"):
+                load_baseline(path, "repo-b")
+
+    def test_version_constraints_support_ranges(self):
+        self.assertTrue(version_satisfies("1.9.4", ">=1.8,<2.0"))
+        self.assertFalse(version_satisfies("2.0.0", ">=1.8,<2.0"))
+        self.assertFalse(version_satisfies(None, ">=1.0"))
+
+    def test_incomplete_scan_does_not_report_findings_as_resolved(self):
+        finding = Finding("vulnerability", "builtin", "high", "dangerous-eval",
+                          "dynamic execution", "app.py", 1)
+        previous = {"scan_complete": True,
+                    "finding_fingerprints": [item["fingerprint"] for item in _finding_records([finding])],
+                    "finding_records": _finding_records([finding])}
+        changes = _finding_lifecycle([], [previous], scan_complete=False)
+        self.assertFalse(changes["available"])
+        self.assertEqual(changes["resolved"], [])
+
+    def test_complete_scan_reports_resolved_findings(self):
+        finding = Finding("vulnerability", "builtin", "high", "dangerous-eval",
+                          "dynamic execution", "app.py", 1)
+        records = _finding_records([finding])
+        previous = {"scan_complete": True, "finding_fingerprints": [records[0]["fingerprint"]],
+                    "finding_records": records}
+        changes = _finding_lifecycle([], [previous], scan_complete=True)
+        self.assertEqual([item["rule"] for item in changes["resolved"]], ["dangerous-eval"])
+
+    def test_finding_lifecycle_marks_reappeared_findings(self):
+        finding = Finding("vulnerability", "builtin", "high", "dangerous-eval",
+                          "dynamic execution", "app.py", 1)
+        records = _finding_records([finding])
+        first = {"scan_complete": True, "finding_fingerprints": [records[0]["fingerprint"]],
+                 "finding_records": records}
+        clean = {"scan_complete": True, "finding_fingerprints": [], "finding_records": []}
+        changes = _finding_lifecycle([finding], [first, clean], scan_complete=True)
+        self.assertEqual([item["rule"] for item in changes["reopened"]], ["dangerous-eval"])
+        self.assertEqual(changes["new"], [])
+
+    def test_baseline_findings_are_excluded_from_score_and_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "repo"
+            out = Path(directory) / "report"
+            root.mkdir()
+            (root / "app.py").write_text("eval(input())\n", encoding="utf-8")
+            finding = Finding("vulnerability", "builtin", "high", "dangerous-eval",
+                              "Вызов eval() - риск выполнения произвольного кода", "app.py", 1)
+            baseline_path = Path(directory) / "baseline.json"
+            write_baseline(baseline_path, build_baseline(_repo_identity(root), [finding]))
+            with patch("pipeline.tool_ruff", return_value=None), \
+                    patch("pipeline.tool_bandit", return_value=None), \
+                    patch("pipeline.tool_semgrep", return_value=None), \
+                    patch("pipeline.tool_gitleaks", return_value=None), \
+                    patch("pipeline.tool_shellcheck", return_value=None), \
+                    patch("pipeline.collect_tool_versions", return_value=({}, {})), \
+                    redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                result = run_pipeline([str(root), "--out", str(out), "--baseline", str(baseline_path)])
+            report = json.loads((out / "report.json").read_text(encoding="utf-8"))
+            markdown = (out / "report.md").read_text(encoding="utf-8")
+            html_report = (out / "report.html").read_text(encoding="utf-8")
+            sarif = json.loads((out / "report.sarif").read_text(encoding="utf-8"))
+            self.assertEqual(result, 0)
+            self.assertEqual(report["summary"]["score"], 100)
+            self.assertEqual(report["summary"]["baseline_count"], 1)
+            self.assertEqual(report["baseline_findings"][0]["rule"], "dangerous-eval")
+            self.assertIn("provenance", report)
+            self.assertIn("Воспроизводимость", markdown)
+            self.assertIn("Воспроизводимость", html_report)
+            self.assertIn("provenance", sarif["runs"][0]["properties"])
+
+    def test_missing_required_analyzer_marks_scan_incomplete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "repo"
+            out = Path(directory) / "report"
+            config = Path(directory) / "config.toml"
+            root.mkdir()
+            (root / "app.py").write_text("pass\n", encoding="utf-8")
+            config.write_text('[tools]\nrequired = ["bandit"]\n', encoding="utf-8")
+            with patch("pipeline.tool_ruff", return_value=None), \
+                    patch("pipeline.tool_bandit", return_value=None), \
+                    patch("pipeline.tool_semgrep", return_value=None), \
+                    patch("pipeline.tool_gitleaks", return_value=None), \
+                    patch("pipeline.tool_shellcheck", return_value=None), \
+                    patch("pipeline.collect_tool_versions", return_value=({}, {})), \
+                    redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                result = run_pipeline([str(root), "--out", str(out), "--config", str(config)])
+            report = json.loads((out / "report.json").read_text(encoding="utf-8"))
+        self.assertEqual(result, 1)
+        self.assertFalse(report["summary"]["scan_complete"])
+        self.assertFalse(report["summary"]["gate_passed"])
+        self.assertTrue(any("bandit" in note for note in report["summary"]["notes"]))
+
+    def test_baseline_update_requires_complete_scan_and_show_is_local(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "repo"
+            out = Path(directory) / "report"
+            baseline_path = Path(directory) / "baseline.json"
+            root.mkdir()
+            (root / "app.py").write_text("pass\n", encoding="utf-8")
+            original = build_baseline(_repo_identity(root), [])
+            write_baseline(baseline_path, original)
+            with patch("pipeline.tool_ruff", return_value=None), \
+                    patch("pipeline.tool_bandit", return_value=None), \
+                    patch("pipeline.tool_semgrep", return_value=None), \
+                    patch("pipeline.tool_gitleaks", return_value=None), \
+                    patch("pipeline.tool_shellcheck", return_value=None), \
+                    patch("pipeline.builtin_style", side_effect=RuntimeError("test failure")), \
+                    patch("pipeline.collect_tool_versions", return_value=({}, {})), \
+                    redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                result = run_pipeline([
+                    str(root), "--out", str(out), "--baseline", str(baseline_path), "--update-baseline"
+                ])
+            shown = StringIO()
+            with redirect_stdout(shown):
+                show_result = run_pipeline(["--show-baseline", str(baseline_path)])
+            persisted = load_baseline(baseline_path, _repo_identity(root))
+        self.assertEqual(result, 1)
+        self.assertEqual(show_result, 0)
+        self.assertIn("Baseline для", shown.getvalue())
+        self.assertEqual(persisted, original)
+
+    def test_baseline_diff_requires_confirmation_before_persisting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "repo"
+            out = Path(directory) / "report"
+            baseline_path = Path(directory) / "baseline.json"
+            root.mkdir()
+            (root / "app.py").write_text("pass\n", encoding="utf-8")
+            old_finding = Finding("vulnerability", "builtin", "high", "old-rule",
+                                  "old issue", "app.py", 1)
+            original = build_baseline(_repo_identity(root), [old_finding])
+            write_baseline(baseline_path, original)
+            output = StringIO()
+            with patch("pipeline.tool_ruff", return_value=None), \
+                    patch("pipeline.tool_bandit", return_value=None), \
+                    patch("pipeline.tool_semgrep", return_value=None), \
+                    patch("pipeline.tool_gitleaks", return_value=None), \
+                    patch("pipeline.tool_shellcheck", return_value=None), \
+                    patch("pipeline.git_audit", return_value=[]), \
+                    patch("pipeline.collect_tool_versions", return_value=({}, {})), \
+                    patch("builtins.input", return_value="n"), \
+                    redirect_stdout(output), redirect_stderr(StringIO()):
+                result = run_pipeline([
+                    str(root), "--out", str(out), "--baseline", str(baseline_path), "--update-baseline"
+                ])
+            persisted = load_baseline(baseline_path, _repo_identity(root))
+            confirmed_output = StringIO()
+            with patch("pipeline.tool_ruff", return_value=None), \
+                    patch("pipeline.tool_bandit", return_value=None), \
+                    patch("pipeline.tool_semgrep", return_value=None), \
+                    patch("pipeline.tool_gitleaks", return_value=None), \
+                    patch("pipeline.tool_shellcheck", return_value=None), \
+                    patch("pipeline.git_audit", return_value=[]), \
+                    patch("pipeline.collect_tool_versions", return_value=({}, {})), \
+                    patch("builtins.input", return_value="y"), \
+                    redirect_stdout(confirmed_output), redirect_stderr(StringIO()):
+                confirm_result = run_pipeline([
+                    str(root), "--out", str(out), "--baseline", str(baseline_path), "--update-baseline"
+                ])
+            approved = load_baseline(baseline_path, _repo_identity(root))
+        self.assertEqual(result, 0)
+        self.assertIn("Diff baseline: +0 новых, -1 удалённых.", output.getvalue())
+        self.assertIn("Baseline не обновлён.", output.getvalue())
+        self.assertEqual(persisted, original)
+        self.assertEqual(confirm_result, 0)
+        self.assertIn("Baseline сохранён:", confirmed_output.getvalue())
+        self.assertEqual(approved["findings"], [])
 
 
 class ScanTests(unittest.TestCase):

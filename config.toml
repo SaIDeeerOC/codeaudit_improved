@@ -16,3 +16,6 @@ min_message_len = 10
 [tools]
 offline = true                      # запрет сетевых обращений
 semgrep_config = "semgrep-rules"    # локальные правила (каталог рядом с pipeline.py)
+required = []                       # необязательные внешние анализаторы, отсутствие которых проваливает gate
+
+[tools.versions]                    # ожидаемые диапазоны; несовпадение блокирует gate
