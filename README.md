@@ -62,7 +62,7 @@ python3 run.py          # Windows: run.bat (двойной клик, затем 
                     └──────────────┴── единый список находок (Finding) ──┴────────────────┘
                                          │ дедупликация, оценка 0-100
                                          ▼
-                      report.json / report.md / report.html + quality gate (код возврата 0/1)
+              report.json / report.md / report.html / report.sarif + quality gate (код возврата 0/1)
 ```
 
 | Стадия | Внешний инструмент (если есть) | Встроенная реализация |
@@ -102,6 +102,11 @@ JWT-токены, учётные данные в адресе (`user:pass@host`)
 - **Каждая стадия независима:** сбой одной не останавливает конвейер, но неполный
   скан не проходит gate. В отчёте будет `scan_complete: false`, а код возврата — 1.
   Некорректный конфиг останавливает запуск с кодом 2.
+- **Контроль охвата.** В отчётах указываются файлы, не проверенные из-за лимита размера,
+  и ошибки чтения/доступа. Ошибки делают скан неполным и блокируют gate; ожидаемые исключения
+  по размеру отображаются, но сами по себе gate не блокируют.
+- **Формат SARIF.** Помимо JSON, Markdown и HTML формируется локальный `report.sarif`
+  версии 2.1.0, включая подавленные находки. Файл не отправляется по сети.
 - **Единые файловые фильтры.** `scan.exclude_dirs` и `scan.max_file_kb` применяются
   к встроенным проверкам, Ruff, Bandit, Semgrep и ShellCheck. Gitleaks получает
   исключения для путей Git-истории и ограничение размера в целых МБ (минимум 1 МБ).
@@ -127,9 +132,13 @@ python3 run.py                                                        # меню
 python3 pipeline.py /путь/к/репо --out report --config config.toml     # код возврата 1, если gate не пройден
 python3 pipeline.py /путь/к/репо --suppressions исключения.toml       # учесть причины/сроки исключений
 python3 pipeline.py /путь/к/репо --out report --no-cache               # то же без переиспользования кэша
+python3 tools/test_python_matrix.py --python C:\Python311\python.exe --python C:\Python314\python.exe
 docker build -t codeaudit . && docker run --rm -v $PWD:/repo -v $PWD/report:/report codeaudit
 cp pre-push-hook.sh .git/hooks/pre-push && chmod +x .git/hooks/pre-push   # проверка перед push
 ```
+
+Локальный тестовый runner запускает набор последовательно на каждой указанной версии Python 3.11+
+и не устанавливает и не загружает интерпретаторы. Без `--python` используется текущая версия.
 
 CI: `.gitea-ci.yml` (запуск на push и pull request, нужна полная история `fetch-depth: 0`).
 Отдельный workflow `.github/workflows/external-tools.yml` устанавливает зафиксированные версии

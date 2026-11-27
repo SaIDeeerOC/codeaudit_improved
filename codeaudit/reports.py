@@ -1,11 +1,14 @@
+import hashlib
 import html
 import json
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from pathlib import PureWindowsPath
+from urllib.parse import quote
 
-from .core import Finding, SEV, WEIGHT
+from .core import Finding, SEV, WEIGHT, atomic_write_text
 from .suppressions import SuppressedFinding
 
 REMEDIATION = {
@@ -41,6 +44,7 @@ class _ReportData:
     delta: int | None
     elapsed: float | None
     scan_complete: bool
+    coverage: dict
     severities: Counter
     categories: Counter
 
@@ -53,14 +57,110 @@ def _finding_location(finding):
     return location
 
 
+def _sarif_rule_id(finding):
+    return f"{finding.tool}/{finding.rule}"
+
+
+def _sarif_level(severity):
+    return "error" if severity in ("high", "critical") else "warning" if severity == "medium" else "note"
+
+
+def _sarif_uri(filename):
+    windows_path = PureWindowsPath(filename)
+    if windows_path.is_absolute() and not Path(filename).is_absolute():
+        return windows_path.as_uri(), False
+    path = Path(filename)
+    if path.is_absolute():
+        return path.as_uri(), False
+    return quote(path.as_posix(), safe="/-._~"), True
+
+
+def _sarif_result(finding, rule_index, suppressed=None):
+    result = {
+        "ruleId": _sarif_rule_id(finding),
+        "ruleIndex": rule_index,
+        "level": _sarif_level(finding.severity),
+        "message": {"text": finding.message},
+        "properties": {"category": finding.category, "tool": finding.tool,
+                       "severity": finding.severity},
+    }
+    if finding.file:
+        uri, relative = _sarif_uri(finding.file)
+        artifact = {"uri": uri}
+        if relative:
+            artifact["uriBaseId"] = "%SRCROOT%"
+        physical_location = {"artifactLocation": artifact}
+        if finding.line > 0:
+            physical_location["region"] = {"startLine": finding.line}
+        result["locations"] = [{"physicalLocation": physical_location}]
+    if finding.commit:
+        result["properties"]["commit"] = finding.commit
+    if suppressed is not None:
+        result["suppressions"] = [{
+            "kind": "external",
+            "status": "accepted",
+            "justification": f"{suppressed.reason} (expires {suppressed.expires})",
+        }]
+    digest_input = "\0".join((result["ruleId"], finding.file, str(finding.line), finding.commit))
+    result["partialFingerprints"] = {
+        "codeaudit/v1": hashlib.sha256(digest_input.encode("utf-8")).hexdigest()
+    }
+    return result
+
+
+def _sarif_document(report):
+    findings = [(finding, None) for finding in report.findings]
+    findings.extend((item.finding, item) for item in report.suppressed_findings)
+    rule_levels = {}
+    rule_properties = {}
+    for finding, _ in findings:
+        rule_id = _sarif_rule_id(finding)
+        level = _sarif_level(finding.severity)
+        rank = {"note": 0, "warning": 1, "error": 2}
+        if rule_id not in rule_levels or rank[level] > rank[rule_levels[rule_id]]:
+            rule_levels[rule_id] = level
+        rule_properties[rule_id] = {"category": finding.category, "tool": finding.tool}
+
+    rule_ids = sorted(rule_levels)
+    rule_indices = {rule_id: index for index, rule_id in enumerate(rule_ids)}
+    rules = [{
+        "id": rule_id,
+        "name": rule_id.rsplit("/", 1)[-1],
+        "shortDescription": {"text": rule_id.rsplit("/", 1)[-1]},
+        "defaultConfiguration": {"level": rule_levels[rule_id]},
+        "properties": rule_properties[rule_id],
+    } for rule_id in rule_ids]
+    results = [_sarif_result(finding, rule_indices[_sarif_rule_id(finding)], suppressed)
+               for finding, suppressed in findings]
+    source_uri = report.root.resolve().as_uri()
+    if not source_uri.endswith("/"):
+        source_uri += "/"
+    return {
+        "$schema": "https://docs.oasis-open.org/sarif/sarif/v2.1.0/errata01/os/schemas/sarif-schema-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {"driver": {"name": "CodeAudit", "rules": rules}},
+            "invocations": [{"executionSuccessful": report.scan_complete}],
+            "originalUriBaseIds": {"%SRCROOT%": {"uri": source_uri}},
+            "results": results,
+            "properties": {
+                "score": report.score,
+                "gatePassed": report.gate_ok,
+                "scanComplete": report.scan_complete,
+                "coverage": report.coverage,
+            },
+        }],
+    }
+
+
 def _write_json_report(outdir, report, summary):
     data = {"summary": summary, "findings": [finding.__dict__ for finding in report.findings],
             "suppressed_findings": [
                 {**item.finding.__dict__, "suppression_reason": item.reason,
                  "suppression_expires": item.expires}
-                for item in report.suppressed_findings]}
-    (outdir / "report.json").write_text(
-        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+                for item in report.suppressed_findings],
+            "coverage": report.coverage}
+    atomic_write_text(outdir / "report.json", json.dumps(data, ensure_ascii=False, indent=2))
 
 
 def _append_markdown_history(markdown, history, delta):
@@ -114,11 +214,25 @@ def _write_markdown_report(outdir, report):
     markdown += [f"| {severity} | {report.severities.get(severity, 0)} |" for severity in reversed(SEV)]
     markdown += ["", "Категории: " +
                  ", ".join(f"{key}: {value}" for key, value in report.categories.items()), ""]
+    markdown.extend([
+        "## Охват сканирования",
+        "",
+        f"Файлов-кандидатов: {report.coverage['files_considered']}; "
+        f"сверх лимита размера: {report.coverage['size_limited_files']}; "
+        f"ошибок доступа: {report.coverage['errors']}.",
+    ])
+    if report.coverage["issues"]:
+        markdown += ["", "| Файл | Причина | Подробности | Блокирует gate |", "|---|---|---|---|"]
+        markdown.extend(
+            f"| {_markdown_cell(issue['file'])} | {_markdown_cell(issue['reason'])} | "
+            f"{_markdown_cell(issue['detail'])} | {'да' if issue['blocks_gate'] else 'нет'} |"
+            for issue in report.coverage["issues"])
+    markdown.append("")
     markdown += [f"_{_markdown_cell(note)}_" for note in report.notes]
     _append_markdown_history(markdown, report.history, report.delta)
     _append_markdown_findings(markdown, report.findings)
     _append_markdown_suppressions(markdown, report.suppressed_findings)
-    (outdir / "report.md").write_text("\n".join(markdown), encoding="utf-8")
+    atomic_write_text(outdir / "report.md", "\n".join(markdown))
 
 
 def _html_finding_row(finding, suppressed, reason, expires, color):
@@ -229,6 +343,7 @@ def _write_html_report(report):
                   "".join(f"<li>{html.escape(str(note))}</li>" for note in report.notes) +
                   "</ul>") if report.notes else ""
     history_html = _history_html(report)
+    coverage_html = _coverage_html(report.coverage)
     severity_summary = ", ".join(
         f"{key}: {value}" for key, value in report.severities.items())
     return "".join((
@@ -246,12 +361,25 @@ def _write_html_report(report):
         f"<p>{severity_summary}</p>"
         f"<p>Сканирование {'полное' if report.scan_complete else 'неполное'}; "
         f"исключено с причиной и сроком: {len(report.suppressed_findings)}</p>"
-        f"{notes_html}{history_html}"
+        f"{notes_html}{history_html}{coverage_html}"
         f"{_html_filters(report)}{_html_table(report)}{_HTML_SCRIPT}"))
 
 
+def _coverage_html(coverage):
+    rows = "".join(
+        f"<tr><td>{html.escape(issue['file'])}</td><td>{html.escape(issue['reason'])}</td>"
+        f"<td>{html.escape(issue['detail'])}</td>"
+        f"<td>{'Да' if issue['blocks_gate'] else 'Нет'}</td></tr>"
+        for issue in coverage["issues"])
+    table = (f"<table><tr><th>Файл<th>Причина<th>Подробности<th>Блокирует gate</tr>{rows}</table>"
+             if rows else "<p>Пропущенных файлов и ошибок доступа не обнаружено.</p>")
+    return (f"<h2>Охват сканирования</h2><p>Файлов-кандидатов: "
+            f"{coverage['files_considered']}; сверх лимита размера: {coverage['size_limited_files']}; "
+            f"ошибок доступа: {coverage['errors']}.</p>{table}")
+
+
 def write_reports(outdir, root, findings, score, gate_ok, notes, history=None, delta=None,
-                  elapsed=None, scan_complete=True, suppressed_findings=None):
+                  elapsed=None, scan_complete=True, suppressed_findings=None, coverage=None):
     outdir.mkdir(parents=True, exist_ok=True)
     suppressed_findings = suppressed_findings or []
     findings = sorted(findings, key=lambda finding: (-SEV.index(finding.severity),
@@ -265,8 +393,11 @@ def write_reports(outdir, root, findings, score, gate_ok, notes, history=None, d
                "score": score, "gate_passed": gate_ok, "scan_complete": scan_complete,
                "by_severity": dict(severities), "by_category": dict(categories),
                "suppressed_count": len(suppressed_findings), "notes": notes}
+    coverage = coverage or {"files_considered": 0, "size_limited_files": 0, "errors": 0, "issues": []}
+    summary["coverage"] = coverage
     report = _ReportData(root, findings, suppressed_findings, score, gate_ok, notes,
-                         history, delta, elapsed, scan_complete, severities, categories)
+                         history, delta, elapsed, scan_complete, coverage, severities, categories)
     _write_json_report(outdir, report, summary)
     _write_markdown_report(outdir, report)
-    (outdir / "report.html").write_text(_write_html_report(report), encoding="utf-8")
+    atomic_write_text(outdir / "report.html", _write_html_report(report))
+    atomic_write_text(outdir / "report.sarif", json.dumps(_sarif_document(report), ensure_ascii=False, indent=2))

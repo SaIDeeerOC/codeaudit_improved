@@ -11,7 +11,7 @@ from unittest.mock import patch
 from bench.bench import _create_work_dir
 from codeaudit.cache import cached_stage
 from codeaudit.config import load_config
-from codeaudit.core import Finding, iter_files
+from codeaudit.core import CoverageIssue, Finding, ScanCoverage, atomic_write_text, iter_files
 from codeaudit.reports import write_reports
 from codeaudit.scanners import (_checked_output, builtin_patterns, builtin_python,
                                 builtin_secrets, tool_ruff)
@@ -78,6 +78,50 @@ class ScanTests(unittest.TestCase):
                      for path in iter_files(root, cfg, {".py"})}
             self.assertEqual(found, {"keep.py"})
 
+    def test_file_coverage_reports_size_limit_without_blocking_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "small.py").write_text("pass\n", encoding="utf-8")
+            (root / "large.py").write_bytes(b"x" * 1025)
+            cfg = load_config(None)
+            cfg["scan"]["max_file_kb"] = 1
+            coverage = ScanCoverage()
+
+            paths = list(iter_files(root, cfg, {".py"}, coverage=coverage))
+            summary = coverage.as_dict()
+            score, high, passed = _quality_gate([], cfg, scan_complete=not coverage.has_errors)
+
+        self.assertEqual([path.name for path in paths], ["small.py"])
+        self.assertEqual(summary["files_considered"], 2)
+        self.assertEqual(summary["size_limited_files"], 1)
+        self.assertEqual(summary["errors"], 0)
+        self.assertEqual(summary["issues"][0]["reason"], "size-limit")
+        self.assertFalse(summary["issues"][0]["blocks_gate"])
+        self.assertEqual((score, high, passed), (100, 0, True))
+
+    def test_file_read_error_is_recorded_and_marks_scan_incomplete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "unreadable.py"
+            source.write_text("pass\n", encoding="utf-8")
+            cfg = load_config(None)
+            coverage = ScanCoverage()
+            original_read_text = Path.read_text
+
+            def read_text(path, *args, **kwargs):
+                if path == source:
+                    raise PermissionError("access denied")
+                return original_read_text(path, *args, **kwargs)
+
+            with patch.object(Path, "read_text", read_text):
+                self.assertEqual(builtin_python(root, cfg, coverage=coverage), [])
+            score, high, passed = _quality_gate([], cfg, scan_complete=not coverage.has_errors)
+
+        self.assertEqual(coverage.as_dict()["errors"], 1)
+        self.assertEqual(coverage.as_dict()["issues"][0]["reason"], "read-error")
+        self.assertTrue(coverage.as_dict()["issues"][0]["blocks_gate"])
+        self.assertEqual((score, high, passed), (100, 0, False))
+
     def test_external_scanner_receives_only_eligible_files(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -114,7 +158,7 @@ class CacheTests(unittest.TestCase):
             cache = {"stages": {}}
             calls = []
 
-            def scan(root_arg, config_arg, skip=None):
+            def scan(root_arg, config_arg, skip=None, coverage=None):
                 self.assertEqual(root_arg, root)
                 self.assertEqual(config_arg, cfg)
                 calls.append(set(skip or ()))
@@ -136,7 +180,7 @@ class CacheTests(unittest.TestCase):
             cfg = load_config(None)
             cache = {"stages": {}}
 
-            def scan(root_arg, config_arg, skip=None):
+            def scan(root_arg, config_arg, skip=None, coverage=None):
                 self.assertEqual(root_arg, root)
                 self.assertEqual(config_arg, cfg)
                 if str(source) in (skip or set()):
@@ -152,11 +196,55 @@ class CacheTests(unittest.TestCase):
             self.assertEqual(second, [])
             self.assertEqual(cache["stages"]["builtin-python"]["changed.py"]["findings"], [])
 
+    def test_scan_errors_are_not_cached_as_clean_results(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "unreadable.py").write_text("pass\n", encoding="utf-8")
+            cfg = load_config(None)
+            cache = {"stages": {}}
+            coverage = ScanCoverage()
+            calls = []
+
+            def scan(root_arg, config_arg, skip=None, coverage=None):
+                calls.append(True)
+                coverage.add_issue(CoverageIssue("unreadable.py", "read-error", "denied", True))
+                return []
+
+            for _ in range(2):
+                cached_stage("builtin-python", scan, root, cfg, cache, coverage=coverage)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(cache["stages"]["builtin-python"], {})
+
 
 class SafetyAndIdentityTests(unittest.TestCase):
     def test_quality_gate_fails_when_scan_is_incomplete(self):
         score, high, passed = _quality_gate([], load_config(None), scan_complete=False)
         self.assertEqual((score, high, passed), (100, 0, False))
+
+    def test_pipeline_reports_read_errors_and_blocks_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "repo"
+            root.mkdir()
+            source = root / "unreadable.py"
+            source.write_text("pass\n", encoding="utf-8")
+            outdir = Path(directory) / "reports"
+            original_read_text = Path.read_text
+
+            def read_text(path, *args, **kwargs):
+                if path == source:
+                    raise PermissionError("access denied")
+                return original_read_text(path, *args, **kwargs)
+
+            with patch.object(Path, "read_text", read_text):
+                with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                    result = run_pipeline([str(root), "--out", str(outdir), "--no-cache"])
+
+            report = json.loads((outdir / "report.json").read_text(encoding="utf-8"))
+            sarif = json.loads((outdir / "report.sarif").read_text(encoding="utf-8"))
+        self.assertEqual(result, 1)
+        self.assertFalse(report["summary"]["scan_complete"])
+        self.assertGreater(report["coverage"]["errors"], 0)
+        self.assertFalse(sarif["runs"][0]["invocations"][0]["executionSuccessful"])
 
     def test_same_directory_names_have_distinct_history_identity(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -183,6 +271,16 @@ class SafetyAndIdentityTests(unittest.TestCase):
     def test_external_tool_failure_is_not_treated_as_clean_output(self):
         with self.assertRaisesRegex(RuntimeError, "кодом 2"):
             _checked_output((2, "[]", "tool error"), "ruff")
+
+    def test_atomic_write_preserves_previous_file_on_replace_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "report.json"
+            target.write_text("previous report", encoding="utf-8")
+            with patch("codeaudit.core.os.replace", side_effect=OSError("replace failed")):
+                with self.assertRaisesRegex(OSError, "replace failed"):
+                    atomic_write_text(target, "new report")
+            self.assertEqual(target.read_text(encoding="utf-8"), "previous report")
+            self.assertEqual(list(Path(directory).glob(".report.json.*.tmp")), [])
 
 
 class SuppressionTests(unittest.TestCase):
@@ -259,7 +357,7 @@ class SuppressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             out = Path(directory) / "report"
             finding = Finding("vulnerability", "builtin", "high", "dangerous-eval",
-                              "<unsafe>", "app.py", 3)
+                              "<unsafe>", "src/app name.py", 3)
             suppressed = SuppressedFinding(finding, "Reviewed by team", "2030-01-01")
             write_reports(out, Path(directory), [], 100, True, ["Reviewed for release"],
                           suppressed_findings=[suppressed])
@@ -274,6 +372,21 @@ class SuppressionTests(unittest.TestCase):
             self.assertIn("&lt;unsafe&gt;", report)
             self.assertEqual(data["summary"]["suppressed_count"], 1)
             self.assertEqual(data["suppressed_findings"][0]["suppression_reason"], "Reviewed by team")
+            sarif = json.loads((out / "report.sarif").read_text(encoding="utf-8"))
+            self.assertEqual(sarif["version"], "2.1.0")
+            self.assertEqual(sarif["$schema"],
+                             "https://docs.oasis-open.org/sarif/sarif/v2.1.0/errata01/os/schemas/"
+                             "sarif-schema-2.1.0.json")
+            result = sarif["runs"][0]["results"][0]
+            self.assertEqual(result["ruleId"], "builtin/dangerous-eval")
+            self.assertEqual(result["level"], "error")
+            self.assertEqual(
+                result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
+                "src/app%20name.py")
+            self.assertEqual(result["locations"][0]["physicalLocation"]["region"]["startLine"], 3)
+            self.assertEqual(result["suppressions"][0]["status"], "accepted")
+            self.assertIn("Reviewed by team", result["suppressions"][0]["justification"])
+            self.assertTrue(sarif["runs"][0]["invocations"][0]["executionSuccessful"])
 
 
 class ProgressTests(unittest.TestCase):

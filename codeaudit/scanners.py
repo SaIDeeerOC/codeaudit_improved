@@ -4,7 +4,7 @@ import re
 import tempfile
 from pathlib import Path
 
-from .core import Finding, PROJECT_ROOT, iter_files, rel, run
+from .core import CoverageIssue, Finding, PROJECT_ROOT, iter_files, rel, run
 
 SECRET_RE = [
     ("aws-access-key", re.compile(r"AKIA[0-9A-Z]{16}"), "critical", "Ключ доступа AWS (access key id)"),
@@ -39,9 +39,9 @@ PATTERN_RULES = [(i, s, re.compile(r), sev, m) for i, s, r, sev, m in [
 ]]
 
 
-def _batches(root, cfg, suffixes, size=100):
+def _batches(root, cfg, suffixes, size=100, coverage=None):
     batch = []
-    for path in iter_files(root, cfg, suffixes):
+    for path in iter_files(root, cfg, suffixes, coverage=coverage):
         batch.append(str(path))
         if len(batch) == size:
             yield batch
@@ -56,8 +56,8 @@ def _checked_output(result, tool, allowed_codes=(0, 1)):
     return result[1]
 
 
-def tool_ruff(root, cfg):
-    files = list(_batches(root, cfg, {".py"}))
+def tool_ruff(root, cfg, coverage=None):
+    files = list(_batches(root, cfg, {".py"}, coverage=coverage))
     out = []
     for batch in files:
         r = run(["ruff", "check", "--output-format", "json", "--select", "E,F,W,B,N,S,C90", *batch], cwd=root)
@@ -72,9 +72,9 @@ def tool_ruff(root, cfg):
     return out
 
 
-def tool_bandit(root, cfg):
+def tool_bandit(root, cfg, coverage=None):
     out = []
-    for batch in _batches(root, cfg, {".py"}):
+    for batch in _batches(root, cfg, {".py"}, coverage=coverage):
         r = run(["bandit", "-f", "json", "-q", *batch], cwd=root)
         if r is None:
             return None
@@ -86,7 +86,7 @@ def tool_bandit(root, cfg):
     return out
 
 
-def tool_semgrep(root, cfg):
+def tool_semgrep(root, cfg, coverage=None):
     semgrep_config = cfg["tools"]["semgrep_config"]
     if semgrep_config == "auto":
         if cfg["tools"].get("offline", True):
@@ -97,7 +97,7 @@ def tool_semgrep(root, cfg):
         if not Path(semgrep_config).exists():
             return None
     out = []
-    for batch in _batches(root, cfg, SRC_SUFFIXES):
+    for batch in _batches(root, cfg, SRC_SUFFIXES, coverage=coverage):
         r = run(["semgrep", "scan", "--config", semgrep_config, "--json",
                  "--metrics=off", "--disable-version-check", "--no-rewrite-rule-ids", *batch],
                 cwd=root, timeout=1800)
@@ -137,8 +137,8 @@ def tool_gitleaks(root, cfg):
                     item["File"], item["StartLine"], item["Commit"][:10]) for item in data]
 
 
-def tool_shellcheck(root, cfg):
-    files = [str(path) for path in iter_files(root, cfg, {".sh"})]
+def tool_shellcheck(root, cfg, coverage=None):
+    files = [str(path) for path in iter_files(root, cfg, {".sh"}, coverage=coverage)]
     if not files:
         return []
     out = []
@@ -168,12 +168,25 @@ def _is_const(node, value):
     return isinstance(node, ast.Constant) and node.value is value
 
 
-def builtin_python(root, cfg, skip=None):
+def _read_text(path, root, coverage):
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError as error:
+        if coverage is None:
+            raise
+        coverage.add_issue(CoverageIssue(rel(root, path), "read-error", str(error), True))
+        return None
+
+
+def builtin_python(root, cfg, skip=None, coverage=None):
     out = []
-    for path in iter_files(root, cfg, {".py"}, skip=skip, label="builtin-python"):
+    for path in iter_files(root, cfg, {".py"}, skip=skip, label="builtin-python", coverage=coverage):
         filename = rel(root, path)
+        source = _read_text(path, root, coverage)
+        if source is None:
+            continue
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+            tree = ast.parse(source)
         except SyntaxError as error:
             out.append(Finding("error", "builtin", "high", "syntax-error", str(error.msg),
                                filename, error.lineno or 0))
@@ -207,16 +220,19 @@ def builtin_python(root, cfg, skip=None):
     return out
 
 
-def builtin_python_lint(root, cfg, skip=None):
+def builtin_python_lint(root, cfg, skip=None, coverage=None):
     style, out = cfg["style"], []
 
     def add(severity, rule, message, filename, line, category="style"):
         out.append(Finding(category, "builtin", severity, rule, message, filename, line))
 
-    for path in iter_files(root, cfg, {".py"}, skip=skip, label="builtin-lint"):
+    for path in iter_files(root, cfg, {".py"}, skip=skip, label="builtin-lint", coverage=coverage):
         filename = rel(root, path)
+        source = _read_text(path, root, coverage)
+        if source is None:
+            continue
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+            tree = ast.parse(source)
         except SyntaxError:
             continue
         nodes = list(ast.walk(tree))
@@ -283,11 +299,15 @@ def builtin_python_lint(root, cfg, skip=None):
     return out
 
 
-def builtin_patterns(root, cfg, skip=None):
+def builtin_patterns(root, cfg, skip=None, coverage=None):
     out = []
-    for path in iter_files(root, cfg, SRC_SUFFIXES, skip=skip, label="builtin-patterns"):
+    for path in iter_files(root, cfg, SRC_SUFFIXES, skip=skip, label="builtin-patterns",
+                           coverage=coverage):
         filename = rel(root, path)
-        for line_number, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+        source = _read_text(path, root, coverage)
+        if source is None:
+            continue
+        for line_number, line in enumerate(source.splitlines(), 1):
             for rule, suffixes, pattern, severity, message in PATTERN_RULES:
                 if (suffixes is None or path.suffix in suffixes) and pattern.search(line):
                     out.append(Finding("vulnerability", "builtin", severity, rule, message,
@@ -295,11 +315,14 @@ def builtin_patterns(root, cfg, skip=None):
     return out
 
 
-def builtin_style(root, cfg, skip=None):
+def builtin_style(root, cfg, skip=None, coverage=None):
     style, out = cfg["style"], []
-    for path in iter_files(root, cfg, SRC_SUFFIXES, skip=skip, label="builtin-style"):
+    for path in iter_files(root, cfg, SRC_SUFFIXES, skip=skip, label="builtin-style",
+                           coverage=coverage):
         filename = rel(root, path)
-        text = path.read_text(encoding="utf-8", errors="replace")
+        text = _read_text(path, root, coverage)
+        if text is None:
+            continue
         lines = text.splitlines()
         trailing = [index for index, line in enumerate(lines, 1) if line != line.rstrip()]
         if trailing:
@@ -333,12 +356,14 @@ def scan_text_for_secrets(text, filename, line_offset=0, commit="", tool="builti
     return out
 
 
-def builtin_secrets(root, cfg, skip=None):
+def builtin_secrets(root, cfg, skip=None, coverage=None):
     out = []
-    for path in iter_files(root, cfg, skip=skip, label="builtin-secrets"):
+    for path in iter_files(root, cfg, skip=skip, label="builtin-secrets", coverage=coverage):
         try:
             data = path.read_bytes()
-        except OSError:
+        except OSError as error:
+            if coverage is not None:
+                coverage.add_issue(CoverageIssue(rel(root, path), "read-error", str(error), True))
             continue
         if b"\0" in data[:2048]:
             continue

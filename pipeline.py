@@ -22,6 +22,7 @@ for stream in (sys.stdout, sys.stderr):
 
 from codeaudit.cache import CACHEABLE, cache_load, cache_save, cached_stage
 from codeaudit.config import load_config
+from codeaudit.core import ScanCoverage, atomic_write_text
 from codeaudit.history import git_audit
 from codeaudit.reports import score_of, write_reports
 from codeaudit.scanners import (builtin_patterns, builtin_python, builtin_python_lint,
@@ -129,27 +130,30 @@ def main(argv=None):
     outdir.mkdir(parents=True, exist_ok=True)
     cache = None if args.no_cache else cache_load(outdir, args.config)
     findings, notes, failed_stages = [], [], []
+    coverage = ScanCoverage()
     stages = [
-        ("ruff", tool_ruff), ("bandit", tool_bandit), ("semgrep", tool_semgrep),
-        ("gitleaks", tool_gitleaks), ("shellcheck", tool_shellcheck),
-        ("builtin-python", builtin_python), ("builtin-lint", builtin_python_lint),
-        ("builtin-patterns", builtin_patterns), ("builtin-style", builtin_style),
-        ("builtin-secrets", builtin_secrets), ("git-audit", git_audit),
+        ("ruff", tool_ruff, True), ("bandit", tool_bandit, True),
+        ("semgrep", tool_semgrep, True), ("gitleaks", tool_gitleaks, False),
+        ("shellcheck", tool_shellcheck, True),
+        ("builtin-python", builtin_python, True), ("builtin-lint", builtin_python_lint, True),
+        ("builtin-patterns", builtin_patterns, True), ("builtin-style", builtin_style, True),
+        ("builtin-secrets", builtin_secrets, True), ("git-audit", git_audit, False),
     ]
     reused_total = 0
-    for index, (name, function) in enumerate(stages):
+    for index, (name, function, coverage_aware) in enumerate(stages):
         print(f"[..] {name}: работаю...", flush=True)
         stage_started = time.monotonic()
         stage_failed = False
         with _StageProgress(index, len(stages), name, stage_started) as stage_progress:
             try:
                 if cache is not None and name in CACHEABLE:
-                    result, reused = cached_stage(name, function, root, cfg, cache)
+                    result, reused = cached_stage(name, function, root, cfg, cache, coverage=coverage)
                     reused_total += reused
                     if reused:
                         notes.append(f"{name}: из кэша переиспользовано файлов: {reused}")
                 else:
-                    result, reused = function(root, cfg), 0
+                    result = function(root, cfg, coverage=coverage) if coverage_aware else function(root, cfg)
+                    reused = 0
             except Exception as error:
                 failed_stages.append(name)
                 notes.append(f"{name}: ошибка {error!r}")
@@ -182,19 +186,24 @@ def main(argv=None):
                      for item in expired_suppressions)
     if suppressed_findings:
         notes.append(f"Исключено по .codeaudit-suppressions.toml: {len(suppressed_findings)} находок.")
-    scan_complete = not failed_stages
+    coverage_data = coverage.as_dict()
+    if coverage_data["size_limited_files"]:
+        notes.append(f"Файлов сверх лимита размера: {coverage_data['size_limited_files']}; см. сведения об охвате.")
+    if coverage_data["errors"]:
+        notes.append(f"Ошибок доступа к файлам или каталогам: {coverage_data['errors']}; скан неполный.")
+    scan_complete = not failed_stages and not coverage.has_errors
     if failed_stages:
         notes.append("Неполный скан: ошибки этапов " + ", ".join(failed_stages))
     score, high, gate_ok = _quality_gate(findings, cfg, scan_complete)
 
     history_path = outdir / "history.jsonl"
     previous = []
-    if history_path.exists():
-        for line in history_path.read_text(encoding="utf-8").splitlines():
-            try:
-                previous.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
+    history_text = history_path.read_text(encoding="utf-8") if history_path.exists() else ""
+    for line in history_text.splitlines():
+        try:
+            previous.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
     repo_id = _repo_identity(root)
     previous_same = [entry for entry in previous if entry.get("repo_id") == repo_id]
     entry = {"date": time.strftime("%Y-%m-%dT%H:%M:%S"), "repo": root.name, "repo_id": repo_id,
@@ -202,13 +211,13 @@ def main(argv=None):
              "severities": dict(Counter(finding.severity for finding in findings)),
              "suppressed": len(suppressed_findings)}
     delta = score - previous_same[-1]["score"] if previous_same else None
-    with history_path.open("a", encoding="utf-8") as stream:
-        stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    separator = "\n" if history_text and not history_text.endswith("\n") else ""
+    atomic_write_text(history_path, history_text + separator + json.dumps(entry, ensure_ascii=False) + "\n")
     elapsed = time.monotonic() - started
     write_reports(outdir, root, findings, score, gate_ok, notes,
                   history=previous_same[-9:] + [dict(entry, current=True)], delta=delta,
                   elapsed=elapsed, scan_complete=scan_complete,
-                  suppressed_findings=suppressed_findings)
+                  suppressed_findings=suppressed_findings, coverage=coverage_data)
     print(f"Оценка {score}/100, high+critical={high}, gate={'OK' if gate_ok else 'FAILED'}; "
           f"отчёты: {args.out}/")
     if not scan_complete:

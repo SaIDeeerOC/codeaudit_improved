@@ -5,10 +5,10 @@ from dataclasses import asdict
 from pathlib import Path
 
 from .config import config_fingerprint
-from .core import Finding, iter_files, rel
+from .core import CoverageIssue, Finding, atomic_write_text, iter_files, rel
 from .scanners import SRC_SUFFIXES
 
-CACHE_VERSION = 3
+CACHE_VERSION = 4
 CACHEABLE = {
     "builtin-python": {".py"},
     "builtin-lint": {".py"},
@@ -30,7 +30,8 @@ def _scan_fingerprint(config_path):
     digest = hashlib.sha256(config_fingerprint(config_path).encode())
     digest.update(f"{sys.version_info.major}.{sys.version_info.minor}".encode())
     package_dir = Path(__file__).resolve().parent
-    sources = [package_dir / name for name in ("core.py", "config.py", "scanners.py", "history.py")]
+    sources = [package_dir / name
+               for name in ("core.py", "config.py", "cache.py", "scanners.py", "history.py")]
     sources.append(package_dir.parent / "pipeline.py")
     for path in sources:
         try:
@@ -73,23 +74,31 @@ def cache_load(outdir, config_path):
 
 
 def cache_save(outdir, cache):
-    (outdir / ".scan_cache.json").write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+    atomic_write_text(outdir / ".scan_cache.json", json.dumps(cache, ensure_ascii=False))
 
 
-def cached_stage(name, fn, root, cfg, cache):
+def cached_stage(name, fn, root, cfg, cache, coverage=None):
     known = cache["stages"].get(name, {})
     if not isinstance(known, dict):
         known = {}
     skip, unchanged = set(), {}
-    paths = list(iter_files(root, cfg, CACHEABLE[name]))
-    for path in paths:
+    paths = []
+    for path in iter_files(root, cfg, CACHEABLE[name], coverage=coverage):
+        try:
+            digest = _file_hash(path)
+        except OSError as error:
+            if coverage is not None:
+                coverage.add_issue(CoverageIssue(rel(root, path), "read-error", str(error), True))
+            continue
+        paths.append(path)
         rel_path = rel(root, path)
-        digest = _file_hash(path)
         entry = known.get(rel_path)
         if entry and entry.get("hash") == digest:
             skip.add(str(path))
             unchanged[rel_path] = entry
-    fresh = list(fn(root, cfg, skip=skip))
+    fresh = list(fn(root, cfg, skip=skip, coverage=coverage))
+    failed_files = ({issue.file for issue in coverage.issues if issue.blocks_gate}
+                    if coverage is not None else set())
     findings_by_file = {}
     for finding in fresh:
         if finding.file:
@@ -97,14 +106,16 @@ def cached_stage(name, fn, root, cfg, cache):
     current_stage = dict(unchanged)
     for path in paths:
         rel_path = rel(root, path)
-        if rel_path in unchanged:
+        if rel_path in unchanged or rel_path in failed_files:
             continue
         try:
             current_stage[rel_path] = {
                 "hash": _file_hash(path),
                 "findings": findings_by_file.get(rel_path, []),
             }
-        except OSError:
+        except OSError as error:
+            if coverage is not None:
+                coverage.add_issue(CoverageIssue(rel_path, "read-error", str(error), True))
             continue
     cache["stages"][name] = current_stage
     replayed = [Finding(**finding) for entry in unchanged.values() for finding in entry["findings"]]

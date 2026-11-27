@@ -2,7 +2,7 @@
 
 A single offline tool that scans source code (bugs, vulnerabilities, code style, secrets)
 and audits the full Git commit history. It scores a repository from 0 to 100, evaluates the
-quality gate, and writes JSON, Markdown, and HTML reports. Built for the MO-1 course project:
+quality gate, and writes JSON, Markdown, HTML, and SARIF reports. Built for the MO-1 course project:
 automation of code-quality analysis and Git auditing without mandatory third-party packages.
 
 ![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue)
@@ -80,6 +80,11 @@ credentials in URLs (`user:pass@host`), and passwords/tokens hardcoded in code.
 - **Fault isolation.** A failing stage never stops the pipeline, but an incomplete scan
   fails the gate (`scan_complete: false`, exit code 1). Invalid configuration exits with
   code 2.
+- **Scan coverage.** Reports list files omitted by the size limit and file/directory access
+  errors. Access errors make the scan incomplete and fail the gate; configured size-limit
+  exclusions are reported but do not fail it by themselves.
+- **SARIF output.** A local `report.sarif` (version 2.1.0) is generated alongside JSON,
+  Markdown, and HTML, including suppressed findings. It is not uploaded or sent over the network.
 - **Consistent file filters.** `scan.exclude_dirs` and `scan.max_file_kb` apply to built-in
   checks, Ruff, Bandit, Semgrep, and ShellCheck. Gitleaks receives Git-history path
   exclusions and a whole-megabyte file-size limit (minimum 1 MB).
@@ -115,6 +120,9 @@ command-argument examples), 210 planted defect pairs:
 - Correct quality-gate decisions: 36/36 (100%)
 - Average analysis time per repository: 0.57 s (max 1.28 s)
 - Run the project tests with `python3 -m unittest discover -s tests -v`.
+- Run tests across locally installed Python 3.11+ interpreters with
+  `python tools/test_python_matrix.py --python C:\Python311\python.exe --python C:\Python314\python.exe`.
+  The runner does not install or download interpreters; without `--python`, it uses the current one.
 
 The checked-in benchmark results are from a previous run. Re-run `bench/bench.py`
 after code changes to refresh the figures and verify the current version.
