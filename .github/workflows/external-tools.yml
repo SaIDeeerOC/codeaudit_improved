@@ -1,0 +1,49 @@
+name: External analyzer integrations
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  external-tools:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install pinned Python analyzers
+        run: |
+          python -m pip install \
+            "ruff==0.17.6" \
+            "bandit==1.9.4" \
+            "semgrep==1.187.0"
+      - name: Install pinned native analyzers
+        shell: bash
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/codeaudit-bin"
+
+          gitleaks_archive="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl -fsSL \
+            "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz" \
+            -o "$gitleaks_archive"
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $gitleaks_archive" \
+            | sha256sum --check
+          tar -xzf "$gitleaks_archive" -C "$RUNNER_TEMP/codeaudit-bin" gitleaks
+
+          shellcheck_archive="$RUNNER_TEMP/shellcheck.tar.xz"
+          curl -fsSL \
+            "https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz" \
+            -o "$shellcheck_archive"
+          echo "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198  $shellcheck_archive" \
+            | sha256sum --check
+          tar -xJf "$shellcheck_archive" -C "$RUNNER_TEMP"
+
+          echo "$RUNNER_TEMP/codeaudit-bin" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/shellcheck-v0.11.0" >> "$GITHUB_PATH"
+      - name: Run tests with external analyzers available
+        run: python -m unittest discover -s tests -v

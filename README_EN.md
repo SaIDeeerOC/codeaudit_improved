@@ -119,6 +119,24 @@ command-argument examples), 210 planted defect pairs:
 The checked-in benchmark results are from a previous run. Re-run `bench/bench.py`
 after code changes to refresh the figures and verify the current version.
 
+### Independent evaluation with OWASP BenchmarkPython
+
+An optional evaluator accepts a local checkout of
+[OWASP BenchmarkPython](https://github.com/OWASP-Benchmark/BenchmarkPython), pinned to commit
+`f1291485808b66e20ddb6b01b10dc71b3df8c8ba` (preliminary v0.1 release, GNU GPL v3).
+The corpus is not included in this repository; the script does not download, copy, or modify it.
+Only categories mapped to built-in CodeAudit rules (`cmdi`, `codeinj`, `deserialization`, `hash`,
+and `sqli`) are scored. Unsupported categories and coverage are reported separately; the result
+is not an official OWASP score.
+
+```bash
+python3 bench/owasp.py --root /path/to/BenchmarkPython
+python3 bench/owasp.py --root /path/to/BenchmarkPython --out evaluation/owasp.md
+```
+
+Evaluation requires an unmodified checkout with the original labels and license. It measures the
+built-in Python and pattern scanners only; optional external tools do not affect the result.
+
 ### Limitations
 
 - The benchmark is synthetic: defects were planted by the authors of the rules. Therefore,
@@ -128,6 +146,8 @@ after code changes to refresh the figures and verify the current version.
 - External tools (ruff, bandit, semgrep, gitleaks, shellcheck) were not installed in the
   development environment; optional integration tests now run automatically when a tool is
   installed and otherwise skip. Verify locally with `pip install ruff bandit semgrep`.
+- `.github/workflows/external-tools.yml` installs pinned versions of the optional analyzers and
+  runs the same integration tests on GitHub Actions. The existing Gitea workflow remains separate.
 - Deep AST analysis is Python-only; other languages use regex rules (possible false
   positives and misses), so semgrep and native linters matter for them.
 - No taint/data-flow analysis: the rules flag dangerous constructs, not proven exploitability.

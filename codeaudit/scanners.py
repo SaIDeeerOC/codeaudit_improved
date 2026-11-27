@@ -218,13 +218,14 @@ def builtin_python_lint(root, cfg, skip=None):
             tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
         except SyntaxError:
             continue
-        used = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
-        for node in ast.walk(tree):
+        nodes = list(ast.walk(tree))
+        used = {node.id for node in nodes if isinstance(node, ast.Name)}
+        for node in nodes:
             if isinstance(node, ast.Assign) and any(
                     isinstance(target, ast.Name) and target.id == "__all__" for target in node.targets):
                 used |= {item.value for item in getattr(node.value, "elts", [])
                          if isinstance(item, ast.Constant)}
-        for node in ast.walk(tree):
+        for node in nodes:
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 if isinstance(node, ast.ImportFrom) and node.module == "__future__":
                     continue
