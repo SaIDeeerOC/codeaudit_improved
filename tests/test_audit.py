@@ -240,7 +240,12 @@ class SuppressionTests(unittest.TestCase):
                 '[[suppressions]]\nrule = "dangerous-eval"\nfile = "app.py"\n'
                 'reason = "Approved isolated teaching example"\nexpires = 2030-01-01\n',
                 encoding="utf-8")
-            with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            with patch("pipeline.tool_ruff", return_value=None), \
+                    patch("pipeline.tool_bandit", return_value=None), \
+                    patch("pipeline.tool_semgrep", return_value=None), \
+                    patch("pipeline.tool_gitleaks", return_value=None), \
+                    patch("pipeline.tool_shellcheck", return_value=None), \
+                    redirect_stdout(StringIO()), redirect_stderr(StringIO()):
                 result = run_pipeline([str(root), "--out", str(out)])
             data = json.loads((out / "report.json").read_text(encoding="utf-8"))
             self.assertEqual(result, 0)

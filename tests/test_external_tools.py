@@ -51,7 +51,7 @@ class ExternalToolIntegrationTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("gitleaks"), "gitleaks is not installed")
     def test_gitleaks_history_finding_is_parsed(self):
-        secret = "ghp_" + "A1b2" * 9
+        secret = "AKIAABCDEFGHIJKLMNOP"
         _write(self.root, "credentials.py", f"example = {secret!r}\n")
         commands = [
             ["git", "-C", str(self.root), "init", "-q"],

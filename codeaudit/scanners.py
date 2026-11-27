@@ -99,7 +99,8 @@ def tool_semgrep(root, cfg):
     out = []
     for batch in _batches(root, cfg, SRC_SUFFIXES):
         r = run(["semgrep", "scan", "--config", semgrep_config, "--json",
-                 "--metrics=off", "--disable-version-check", *batch], cwd=root, timeout=1800)
+                 "--metrics=off", "--disable-version-check", "--no-rewrite-rule-ids", *batch],
+                cwd=root, timeout=1800)
         if r is None:
             return None
         m = {"INFO": "low", "WARNING": "medium", "ERROR": "high"}
